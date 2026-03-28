@@ -1,0 +1,122 @@
+[
+    {
+        "id": 1,
+        "name": "سعيد صلاح",
+        "domain": "https://saeedsalah.com/",
+        "specialty": "عطور وماركات عالمية"
+    },
+    {
+        "id": 2,
+        "name": "فانيلا (Vanilla)",
+        "domain": "https://vanilla.sa/",
+        "specialty": "عطور وتجميل"
+    },
+    {
+        "id": 3,
+        "name": "سارا ميكب",
+        "domain": "https://sara-makeup.com/",
+        "specialty": "مكياج وعطور"
+    },
+    {
+        "id": 4,
+        "name": "خبير العطور",
+        "domain": "https://alkhabeershop.com/",
+        "specialty": "عطور أصلية وعينات"
+    },
+    {
+        "id": 5,
+        "name": "قولدن سنت",
+        "domain": "https://www.goldenscent.com/",
+        "specialty": "رائد عطور الماركات"
+    },
+    {
+        "id": 6,
+        "name": "لي سانتو",
+        "domain": "https://leesanto.com/",
+        "specialty": "عطور نيش وديزاينر"
+    },
+    {
+        "id": 7,
+        "name": "آزال (Azal)",
+        "domain": "https://azalperfume.com/",
+        "specialty": "عطور عالمية نادرة"
+    },
+    {
+        "id": 8,
+        "name": "كاندي نيش",
+        "domain": "https://candyniche.com/",
+        "specialty": "عطور نيش"
+    },
+    {
+        "id": 9,
+        "name": "الفاخرة للنيش",
+        "domain": "https://luxuryperfumesnish.com/",
+        "specialty": "نيش بأسعار تنافسية"
+    },
+    {
+        "id": 10,
+        "name": "حنان العطور",
+        "domain": "https://hanan-store55.com/",
+        "specialty": "عالمية ونيش"
+    },
+    {
+        "id": 11,
+        "name": "اريج امواج",
+        "domain": "https://areejamwaj.com/",
+        "specialty": "ماركات أصلية"
+    },
+    {
+        "id": 12,
+        "name": "نايس ون",
+        "domain": "https://niceonesa.com/",
+        "specialty": "أكبر منصة تجميل"
+    },
+    {
+        "id": 13,
+        "name": "سيفورا",
+        "domain": "https://www.sephora.me/sa-ar",
+        "specialty": "المرجع العالمي"
+    },
+    {
+        "id": 14,
+        "name": "وجوه",
+        "domain": "https://www.faces.sa/ar",
+        "specialty": "فاخرة"
+    },
+    {
+        "id": 15,
+        "name": "نيش",
+        "domain": "https://niche.sa/",
+        "specialty": "نيش ونادرة"
+    },
+    {
+        "id": 16,
+        "name": "عالم جيفنشي",
+        "domain": "https://worldgivenchy.com/",
+        "specialty": "جملة وقطاعي"
+    },
+    {
+        "id": 17,
+        "name": "ساره ستور",
+        "domain": "https://sarahmakeup37.com/",
+        "specialty": "عناية ومكياج"
+    },
+    {
+        "id": 18,
+        "name": "اروماتيك كلاود",
+        "domain": "https://aromaticcloud.com/",
+        "specialty": "محاكية ومستوحاة"
+    },
+    {
+        "id": 19,
+        "name": "تطيّب",
+        "domain": "https://tatayab.com/",
+        "specialty": "عطور وبخور"
+    },
+    {
+        "id": 20,
+        "name": "كيان بيوتي",
+        "domain": "https://kayan9.com/",
+        "specialty": "عناية وتجميل"
+    }
+]

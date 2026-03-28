@@ -1,0 +1,38 @@
+# أسرار محلية — لا تُرفع إلى Git
+.streamlit/secrets.toml
+.env
+.env.*
+*.db
+__pycache__/
+*.pyc
+.pytest_cache/
+.venv/
+venv/
+
+# بيانات تشغيل / كشط — قد تحتوي أسعاراً ومنتجات حقيقية
+data/competitors_latest.csv
+data/*.csv
+data/scraper_state.db
+data/scraper_progress.json
+data/scraper_last_run.json
+data/final_priced_latest.csv
+data/final_priced_latest_meta.json
+!data/.gitkeep
+
+# سجلات وأدوات
+*.log
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+.cursor/
+
+# تغطية اختبارات
+htmlcov/
+.coverage
+coverage.xml
+
+# حزم بناء
+dist/
+build/
+*.egg-info/
