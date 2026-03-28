@@ -89,6 +89,12 @@ except Exception:
         def send_approved_prices_to_make(df):
             return False
 from utils.competitor_manager import render_competitor_scrape_page
+from utils.live_pricing_dashboard import (
+    LIVE_RESULT_PAGES,
+    render_live_sidebar_controls,
+    run_live_section,
+)
+from utils.pricing_pipeline import load_competitors_latest_for_engine
 from utils.db_manager import (init_db, log_event, log_decision,
                                log_analysis, get_events, get_decisions,
                                get_analysis_history, upsert_price_history,
@@ -1209,6 +1215,9 @@ with st.sidebar:
     if page == "📊 لوحة التسعير":
         page = "📊 لوحة التحكم"
 
+    if page in LIVE_RESULT_PAGES:
+        render_live_sidebar_controls()
+
     st.markdown(
         '<p style="font-size:0.85rem;margin:8px 0;line-height:1.4;">'
         "🏢 <b>كشط المنافسين:</b> افتح القسم <b>🏢 كشط المنافسين</b> لإضافة روابط Sitemap "
@@ -1724,6 +1733,8 @@ elif page == "📂 رفع الملفات":
     st.header("📂 رفع الملفات")
     db_log("upload", "view")
     _autoload_internal_store_catalog(show_message=True)
+    _store_df = st.session_state.get("store_df")
+    has_internal_store = isinstance(_store_df, pd.DataFrame) and not _store_df.empty
 
     with st.expander("⚙️ تحديث قاعدة بيانات متجر مهووس (للنظام الداخلي)", expanded=False):
         st.caption("ارفع ملف CSV/Excel واحد ليتم حفظه داخلياً واستخدامه تلقائياً في كل تشغيل.")
@@ -1754,6 +1765,23 @@ elif page == "📂 رفع الملفات":
                                    type=["csv","xlsx","xls"],
                                    accept_multiple_files=True, key="comp_files")
 
+    _scrape_csv_path = os.path.join(os.getcwd(), "data", "competitors_latest.csv")
+    _scrape_available = os.path.isfile(_scrape_csv_path)
+    use_web_scrape = st.checkbox(
+        "استخدم تلقائياً نتيجة كشط الويب (`data/competitors_latest.csv`) كمصدر للمنافسين",
+        value=False,
+        key="analysis_use_web_scrape",
+        disabled=not _scrape_available,
+        help="يُقرأ الملف من القرص مباشرة. أثناء كتابة الكاشط قد تفشل القراءة مؤقتاً — أعد المحاولة بعد ثوانٍ.",
+    )
+    if use_web_scrape and _scrape_available:
+        st.info(
+            "سيجري **نفس مسار التحليل** (مطابقة + Gemini + توزيع الأقسام): منتجاتكم مقابل بيانات الكشط. "
+            "يمكنك الجمع مع ملفات منافس مرفوعة أعلاه."
+        )
+    elif not _scrape_available:
+        st.caption("لتفعيل الخيار: شغّل «كشط المنافسين» حتى يُنشأ الملف.")
+
     col_opt1, col_opt2 = st.columns(2)
     with col_opt1:
         bg_mode  = st.checkbox("⚡ معالجة خلفية (يمكنك التنقل أثناء التحليل)", value=True)
@@ -1768,56 +1796,73 @@ elif page == "📂 رفع الملفات":
         )
 
     # ── تعيين أعمدة (قائمة منسدلة مصغّرة داخل expander) ──
-    if our_file and comp_files:
-        our_peek, our_peek_err = read_file(our_file, preview_rows=_PEEK_ROWS)
-        if our_peek_err:
-            st.warning(f"⚠️ معاينة أعمدة منتجاتنا: {our_peek_err}")
-        elif our_peek is not None and len(our_peek.columns) > 0:
-            _osig = _upload_file_sig(our_file)
-            _oc = [str(c) for c in our_peek.columns]
-            _dn, _dp, _di = guess_default_columns(our_peek)
-            _id_opts = [_NO_ID_LABEL] + _oc
-            _idi = 0
-            if _di and _di in _oc:
-                _idi = _oc.index(_di) + 1
-            with st.expander("📋 تعيين الأعمدة — تحقق يدوي (منسدل)", expanded=False):
+    _can_configure_cols = (our_file or has_internal_store) and (
+        comp_files or (use_web_scrape and _scrape_available)
+    )
+    if _can_configure_cols:
+        with st.expander("📋 تعيين الأعمدة — تحقق يدوي (منسدل)", expanded=False):
+            st.session_state["_colmap_comp"] = {}
+            if our_file:
+                our_peek, our_peek_err = read_file(our_file, preview_rows=_PEEK_ROWS)
+                if our_peek_err:
+                    st.warning(f"⚠️ معاينة أعمدة منتجاتنا: {our_peek_err}")
+                elif our_peek is not None and len(our_peek.columns) > 0:
+                    _osig = _upload_file_sig(our_file)
+                    _oc = [str(c) for c in our_peek.columns]
+                    _dn, _dp, _di = guess_default_columns(our_peek)
+                    _id_opts = [_NO_ID_LABEL] + _oc
+                    _idi = 0
+                    if _di and _di in _oc:
+                        _idi = _oc.index(_di) + 1
+                    st.caption(
+                        "يُعاد تسمية المختار داخلياً إلى: **اسم المنتج**، **السعر**، و**رقم المنتج** (إن وُجد)."
+                    )
+                    st.caption(
+                        "**المعرّف (اختياري):** عمود يثبت هوية الصنف — مثل رقم المنتج، SKU، الباركود، أو كود ERP. "
+                        "يُحسّن مطابقة الكتالوج عند إعادة رفع الملف. **إن لم يوجد** في الجدول، اختر «بدون معرّف»."
+                    )
+                    u1, u2, u3 = st.columns(3)
+                    with u1:
+                        _sn = st.selectbox(
+                            "منتجاتنا · الاسم",
+                            _oc,
+                            index=_col_select_index(_oc, _dn),
+                            key=f"map_our_n_{_osig}",
+                            help="عمود اسم المنتج الظاهر للعميل.",
+                        )
+                    with u2:
+                        _sp = st.selectbox(
+                            "منتجاتنا · السعر",
+                            _oc,
+                            index=_col_select_index(_oc, _dp),
+                            help="عمود السعر الرقمي (ر.س أو ما يعادله).",
+                        )
+                    with u3:
+                        _si = st.selectbox(
+                            "منتجاتنا · المعرّف",
+                            _id_opts,
+                            index=_idi,
+                            key=f"map_our_i_{_osig}",
+                            help="SKU / رقم منتج / باركود — أو «بدون معرّف».",
+                        )
+                    st.session_state["_colmap_our"] = (
+                        _sn,
+                        _sp,
+                        None if _si == _NO_ID_LABEL else _si,
+                    )
+                else:
+                    st.session_state.pop("_colmap_our", None)
+            else:
                 st.caption(
-                    "يُعاد تسمية المختار داخلياً إلى: **اسم المنتج**، **السعر**، و**رقم المنتج** (إن وُجد)."
+                    "مصدر منتجاتنا: **الكتالوج الداخلي لمهووس** (الملف المحمّل تلقائياً أو من «تحديث قاعدة البيانات» أعلاه)."
                 )
-                st.caption(
-                    "**المعرّف (اختياري):** عمود يثبت هوية الصنف — مثل رقم المنتج، SKU، الباركود، أو كود ERP. "
-                    "يُحسّن مطابقة الكتالوج عند إعادة رفع الملف. **إن لم يوجد** في الجدول، اختر «بدون معرّف»."
+                st.session_state.pop("_colmap_our", None)
+            if use_web_scrape and _scrape_available:
+                st.info(
+                    "**المنافسون من كشط الويب:** يُستخدم `competitors_latest.csv` — الأعمدة تُوحَّد تلقائياً "
+                    "(اسم / سعر / رابط). يمكن الجمع مع ملفات منافس مرفوعة أدناه."
                 )
-                u1, u2, u3 = st.columns(3)
-                with u1:
-                    _sn = st.selectbox(
-                        "منتجاتنا · الاسم",
-                        _oc,
-                        index=_col_select_index(_oc, _dn),
-                        key=f"map_our_n_{_osig}",
-                        help="عمود اسم المنتج الظاهر للعميل.",
-                    )
-                with u2:
-                    _sp = st.selectbox(
-                        "منتجاتنا · السعر",
-                        _oc,
-                        index=_col_select_index(_oc, _dp),
-                        help="عمود السعر الرقمي (ر.س أو ما يعادله).",
-                    )
-                with u3:
-                    _si = st.selectbox(
-                        "منتجاتنا · المعرّف",
-                        _id_opts,
-                        index=_idi,
-                        key=f"map_our_i_{_osig}",
-                        help="SKU / رقم منتج / باركود — أو «بدون معرّف».",
-                    )
-                st.session_state["_colmap_our"] = (
-                    _sn,
-                    _sp,
-                    None if _si == _NO_ID_LABEL else _si,
-                )
-                st.session_state["_colmap_comp"] = {}
+            if comp_files:
                 for _ci, _cf in enumerate(comp_files):
                     _cdf, _ce = read_file(_cf, preview_rows=_PEEK_ROWS)
                     if _ce or _cdf is None or len(_cdf.columns) == 0:
@@ -1862,11 +1907,9 @@ elif page == "📂 رفع الملفات":
                         None if _cidv == _NO_ID_LABEL else _cidv,
                     )
 
-    _store_df = st.session_state.get("store_df")
-    has_internal_store = isinstance(_store_df, pd.DataFrame) and not _store_df.empty
-
     if st.button("🚀 بدء التحليل", type="primary"):
-        if (our_file or has_internal_store) and comp_files:
+        _have_competitor_source = bool(comp_files) or (use_web_scrape and _scrape_available)
+        if (our_file or has_internal_store) and _have_competitor_source:
             if our_file:
                 our_df, err = read_file(our_file)
                 if err:
@@ -1888,25 +1931,32 @@ elif page == "📂 رفع الملفات":
                     our_df = our_df.head(int(max_rows))
 
                 comp_dfs = {}
-                for cf in comp_files:
-                    cdf, cerr = read_file(cf)
-                    if cerr:
-                        st.warning(f"⚠️ {cf.name}: {cerr}")
-                    else:
-                        _cs = _upload_file_sig(cf)
-                        _trip = _cmap.get(_cs)
-                        if _trip:
-                            _pn, _pp, _pid = _trip
-                            cdf = apply_column_mapping(cdf, _pn, _pp, _pid)
+                if use_web_scrape and _scrape_available:
+                    df_sc, sc_err = load_competitors_latest_for_engine(_scrape_csv_path)
+                    if sc_err:
+                        st.error(f"❌ ملف كشط الويب: {sc_err}")
+                        st.stop()
+                    comp_dfs["كشط_الويب"] = df_sc
+                if comp_files:
+                    for cf in comp_files:
+                        cdf, cerr = read_file(cf)
+                        if cerr:
+                            st.warning(f"⚠️ {cf.name}: {cerr}")
                         else:
-                            _gn, _gp, _gi = guess_default_columns(cdf)
-                            cdf = apply_column_mapping(cdf, _gn, _gp, _gi)
-                        comp_dfs[cf.name] = cdf
+                            _cs = _upload_file_sig(cf)
+                            _trip = _cmap.get(_cs)
+                            if _trip:
+                                _pn, _pp, _pid = _trip
+                                cdf = apply_column_mapping(cdf, _pn, _pp, _pid)
+                            else:
+                                _gn, _gp, _gi = guess_default_columns(cdf)
+                                cdf = apply_column_mapping(cdf, _gn, _gp, _gi)
+                            comp_dfs[cf.name] = cdf
 
                 if comp_dfs:
                     _comp_rows = sum(len(x) for x in comp_dfs.values())
                     st.caption(
-                        f"📄 **منتجاتنا:** {len(our_df)} صف — **المنافسون:** {_comp_rows} صفاً عبر {len(comp_dfs)} ملفاً"
+                        f"📄 **منتجاتنا:** {len(our_df)} صف — **المنافسون:** {_comp_rows} صفاً عبر {len(comp_dfs)} مصدراً"
                     )
                     # ── v26: upsert كتالوج يومي بدون تكرار ──────────
                     with st.spinner("📦 تحديث الكتالوج اليومي..."):
@@ -1924,11 +1974,11 @@ elif page == "📂 رفع الملفات":
 
                     if bg_mode:
                         # ── خلفية ──
+                        _src_label = our_file.name if our_file else os.path.basename(INTERNAL_STORE_PATH)
                         t = threading.Thread(
                             target=_run_analysis_background,
-                            args=(job_id, our_df, comp_dfs,
-                                  our_file.name, comp_names),
-                            daemon=True
+                            args=(job_id, our_df, comp_dfs, _src_label, comp_names),
+                            daemon=True,
                         )
                         # ربط الثريد بسياق Streamlit — يمنع توقف المعالجة
                         add_script_run_ctx(t)
@@ -1967,7 +2017,10 @@ elif page == "📂 رفع الملفات":
                         st.balloons()
                         st.rerun()
         else:
-            st.warning("⚠️ ارفع ملف منافس واحد على الأقل، وتأكد من توفر ملف متجر مهووس (رفع يدوي أو داخلي تلقائي).")
+            st.warning(
+                "⚠️ يلزم **مصدر منافسين**: إما رفع ملف منافس، أو تفعيل **استخدم نتيجة كشط الويب** عندما يكون "
+                "`competitors_latest.csv` موجوداً — ومع **كتالوج مهووس** (رفع أو تحميل تلقائي)."
+            )
 
 
 # ════════════════════════════════════════════════
@@ -1980,6 +2033,9 @@ elif page == "🔴 سعر أعلى":
         "كل المقارنات هنا هي **Competitor vs Mahwous** فقط."
     )
     db_log("price_raise", "view")
+    run_live_section("🔴 سعر أعلى")
+    st.markdown("---")
+    st.markdown("### 📂 عرض الجلسة (تحليل الرفع)")
     if st.session_state.results and "price_raise" in st.session_state.results:
         df = st.session_state.results["price_raise"]
         if not df.empty:
@@ -2023,6 +2079,9 @@ elif page == "🟢 سعر أقل":
         f"المقارنة هنا ثابتة: **{MAIN_STORE_NAME} ({MAIN_STORE_DOMAIN})** مقابل المنافسين."
     )
     db_log("price_lower", "view")
+    run_live_section("🟢 سعر أقل")
+    st.markdown("---")
+    st.markdown("### 📂 عرض الجلسة (تحليل الرفع)")
     if st.session_state.results and "price_lower" in st.session_state.results:
         df = st.session_state.results["price_lower"]
         if not df.empty:
@@ -2065,6 +2124,9 @@ elif page == "✅ موافق عليها":
         f"الأسعار متوازنة بالنسبة لمرجعنا الأساسي **{MAIN_STORE_NAME} ({MAIN_STORE_DOMAIN})**."
     )
     db_log("approved", "view")
+    run_live_section("✅ موافق عليها")
+    st.markdown("---")
+    st.markdown("### 📂 عرض الجلسة (تحليل الرفع)")
     if st.session_state.results and "approved" in st.session_state.results:
         df = st.session_state.results["approved"]
         if not df.empty:
@@ -2090,6 +2152,9 @@ elif page == "🔍 منتجات مفقودة":
         f"منتجات تظهر عند المنافسين ولا تطابق كتالوج **{MAIN_STORE_NAME} ({MAIN_STORE_DOMAIN})** بعد."
     )
     db_log("missing", "view")
+    run_live_section("🔍 منتجات مفقودة")
+    st.markdown("---")
+    st.markdown("### 📂 عرض الجلسة (تحليل الرفع)")
 
     if st.session_state.results and "missing" in st.session_state.results:
         df = st.session_state.results["missing"]
@@ -2519,6 +2584,9 @@ elif page == "⚠️ تحت المراجعة":
         f"راجع المطابقة قبل القرار — خط الأساس الإجباري هو **{MAIN_STORE_NAME} ({MAIN_STORE_DOMAIN})**."
     )
     db_log("review", "view")
+    run_live_section("⚠️ تحت المراجعة")
+    st.markdown("---")
+    st.markdown("### 📂 عرض الجلسة (تحليل الرفع)")
 
     if st.session_state.results and "review" in st.session_state.results:
         df = st.session_state.results["review"]
