@@ -1,0 +1,19 @@
+---
+description: Mandatory first-session Git sync and codebase read before any project code
+alwaysApply: true
+---
+
+# Session start — Git sync SOP (mandatory)
+
+Before writing or suggesting **executable project code** in this repo:
+
+1. **Branch:** Run terminal — `git status -sb` and `git branch --show-current`. Do not assume branch from memory.
+2. **Fetch & sync:** `git fetch origin --prune`. Compare `HEAD` to `origin/<branch>` (e.g. `git log --oneline HEAD..origin/main`). Pull only with a **clean** or explicitly stashed tree; prefer `git pull --ff-only origin <branch>`.
+3. **Deep read:** Use `git log -n 15 --oneline` and **read actual files** / diffs for the feature area. Do not rely on cached conversation context alone.
+4. **Context confirmation:** Output a short **`[SOP]`** text summary (branch, fetch/pull result, 2–5 bullets on recent relevant changes, working tree state). **No project code until this summary is done.**
+
+**Stop conditions:** On merge conflicts — stop and tell the user to resolve before coding. On fetch/pull/auth failure — warn clearly; no blind edits “as if remote were synced.”
+
+Full commands and edge cases: **`docs/SESSION_GIT_SYNC_SOP.md`**.
+
+**Forbidden:** placeholders like `// add code here`; assuming file contents without reading after sync.
