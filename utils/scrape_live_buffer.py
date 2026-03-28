@@ -109,18 +109,25 @@ def replace_pricing_preview(df: pd.DataFrame) -> None:
         _pricing_preview_ts = _utc_ts()
 
 
-def push_scraped_product(row: Dict[str, Any]) -> None:
+def push_scraped_product(
+    row: Dict[str, Any],
+    extraction_method: str = "",
+) -> None:
     """دفع فوري لصف منتج منافس ناجح (قبل تصدير CSV الدفعي)."""
     if not row:
         return
+    img = str(row.get("image_url", "") or row.get("comp_image_url", "") or "").strip()
     entry = {
         "ts": _utc_ts(),
         "name": str(row.get("name", "") or ""),
         "price": float(row.get("price", 0) or 0),
         "brand": str(row.get("brand", "") or ""),
         "comp_url": str(row.get("comp_url", "") or ""),
-        "image_url": str(row.get("image_url", "") or ""),
+        "image_url": img,
         "sku": str(row.get("sku", "") or ""),
+        "Extraction_Method": (extraction_method or row.get("extraction_method") or "").strip()
+        or "unknown",
+        "image_status": "ok" if img else "pending_search",
     }
     with _LOCK:
         _recent_products.append(entry)

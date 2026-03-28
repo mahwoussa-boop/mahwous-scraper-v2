@@ -51,9 +51,113 @@ MAX_URL_ATTEMPTS = int(os.environ.get("SCRAPER_MAX_URL_ATTEMPTS", "3"))
 _USER_AGENTS: List[str] = [
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36 Edg/121.0.0.0",
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.2 Safari/605.1.15",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Safari/605.1.15",
     "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:122.0) Gecko/20100101 Firefox/122.0",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:121.0) Gecko/20100101 Firefox/121.0",
+]
+
+_ACCEPT_LANGUAGES: List[str] = [
+    "ar-SA,ar;q=0.9,en-US;q=0.8,en;q=0.7",
+    "ar,en-US;q=0.9,en;q=0.8",
+    "en-US,en;q=0.9,ar-SA;q=0.8,ar;q=0.7",
+    "ar-SA,ar;q=0.95,en-GB;q=0.85,en;q=0.8",
+    "en-GB,en;q=0.9,ar;q=0.8",
+]
+
+# فلترة روابط غير المنتجات قبل الطابور
+_NON_PRODUCT_PATH_RE = re.compile(
+    r"/(cart|checkout|wishlist|basket|account|login|signin|signup|register|logout|"
+    r"privacy|policy|policies|terms|conditions|about|contact|faq|help|support|"
+    r"search|compare|orders?|thank-you|unsubscribe|subscribe|gift)",
+    re.I,
+)
+
+_SAR_PRICE_AFTER = re.compile(
+    r"(?:SAR|ر\.?\s*س(?:المملكة)?|ريال(?:\s*سعودي)?|SR)\s*[:\s]*"
+    r"(\d{1,3}(?:[,\s]\d{3})*(?:\.\d{1,3})?)",
+    re.I,
+)
+_SAR_PRICE_BEFORE = re.compile(
+    r"(\d{1,3}(?:[,\s]\d{3})*(?:\.\d{1,3})?)\s*(?:SAR|ر\.?\s*س|ريال|SR)\b",
+    re.I,
+)
+
+# تسلسل CSS: (وسم_التشخيص، محددات_الاسم، محددات_السعر)
+_HYBRID_CSS_LAYERS: List[Tuple[str, List[str], List[str]]] = [
+    (
+        "css_salla",
+        [
+            "h1.product__title",
+            "h1.detail__title",
+            ".product-title h1",
+            ".product-details h1",
+            "h1",
+        ],
+        [
+            ".product-price",
+            ".detail-price",
+            ".price-current",
+            "[data-product-price]",
+            ".price-wrapper .amount",
+            "span.price",
+            ".product-form__info .price",
+            ".product__price",
+        ],
+    ),
+    (
+        "css_shopify",
+        [
+            "h1.product__title",
+            "h1.product-single__title",
+            "[data-product-title]",
+            ".product-meta h1",
+            "h1.h0",
+            "h1",
+        ],
+        [
+            ".price-item--sale",
+            ".price-item--regular",
+            "span.product-price",
+            "[data-product-price]",
+            ".price .money",
+            ".price__regular .money",
+            "ins .money",
+            ".product__price",
+        ],
+    ),
+    (
+        "css_zid",
+        [
+            "h1.product-title",
+            "h1.detail-title",
+            ".product-details h1",
+            ".product-info h1",
+            "h1",
+        ],
+        [
+            ".product-price",
+            ".price-value",
+            "[data-price]",
+            ".current-price",
+            ".product-form .price",
+            ".price",
+        ],
+    ),
+    (
+        "css_schema_generic",
+        [
+            "[itemprop=name]",
+            "h1",
+        ],
+        [
+            "[itemprop=price]",
+            "meta[itemprop=price]",
+            "[data-price]",
+        ],
+    ),
 ]
 
 
@@ -65,6 +169,7 @@ class ScrapeAttempt:
     row: Optional[Dict[str, Any]] = None
     error_code: str = ""
     error_detail: str = ""
+    extraction_method: str = ""
 
     def failure_message(self) -> str:
         if self.ok:
@@ -73,6 +178,8 @@ class ScrapeAttempt:
         if self.error_detail:
             parts.append(self.error_detail[:240])
         return " | ".join(parts)
+
+
 FAILED_RETENTION_HOURS = int(os.environ.get("SCRAPER_FAILED_RETENTION_HOURS", "72"))
 COMPLETED_RETENTION_HOURS = int(os.environ.get("SCRAPER_COMPLETED_RETENTION_HOURS", "168"))
 
@@ -223,7 +330,53 @@ def _normalize_competitor_domain(raw: str) -> str:
     return s
 
 
+def _is_processable_product_url(url: str) -> bool:
+    """يستبعد صفحات الحساب/السلة/السياسات وغيرها — يركّز الطابور على صفحات منتج محتملة."""
+    if not url or not str(url).strip().lower().startswith("http"):
+        return False
+    try:
+        p = urlparse(url.strip())
+        pl = (p.path or "").lower()
+    except Exception:
+        return False
+    if _NON_PRODUCT_PATH_RE.search(pl):
+        return False
+    if pl.endswith(".xml") or "sitemap" in pl:
+        return False
+    if any(
+        x in pl
+        for x in (
+            "/blog/",
+            "/blogs/",
+            "/magazine/",
+            "/news/",
+            "/article/",
+            "/tag/",
+            "/tags/",
+        )
+    ):
+        return False
+    if "/collection" in pl and "/products/" not in pl:
+        return False
+    if "/category" in pl and "/product" not in pl:
+        return False
+    if re.search(r"/p\d+$", pl):
+        return True
+    if "/products/" in pl:
+        return True
+    if re.search(r"/product/[^/]+", pl, re.I):
+        return True
+    if re.search(r"/item/[^/]+", pl, re.I):
+        return True
+    if re.search(r"-p-\d+(\.html)?$", pl, re.I):
+        return True
+    return False
+
+
 def _insert_discovered_urls(sitemap_url: str, urls: List[str]) -> int:
+    if not urls:
+        return 0
+    urls = [u for u in urls if _is_processable_product_url(u)]
     if not urls:
         return 0
     now = _utc_now()
@@ -250,6 +403,8 @@ def _insert_discovered_urls(sitemap_url: str, urls: List[str]) -> int:
 
 
 def _load_pending_urls(limit: int) -> List[str]:
+    want = max(1, int(limit))
+    fetch_n = min(max(want * 8, want), 4000)
     conn = _get_state_conn()
     rows = conn.execute(
         """
@@ -260,10 +415,17 @@ def _load_pending_urls(limit: int) -> List[str]:
         ORDER BY updated_at ASC, created_at ASC
         LIMIT ?
         """,
-        (int(MAX_URL_ATTEMPTS), int(limit)),
+        (int(MAX_URL_ATTEMPTS), fetch_n),
     ).fetchall()
     conn.close()
-    return [str(r["url"]) for r in rows]
+    out: List[str] = []
+    for r in rows:
+        u = str(r["url"])
+        if _is_processable_product_url(u):
+            out.append(u)
+        if len(out) >= want:
+            break
+    return out
 
 
 def _mark_url_status(url: str, status: str, error: str = "") -> None:
@@ -676,26 +838,42 @@ def _first_product_node(obj: Any) -> Optional[dict]:
 
 
 class AsyncCompetitorScraper:
-    """جلب صفحات المنتجات — JSON-LD أولاً، ثم meta، مع حد تزامن وتأخير مهذب."""
+    """محرك هجين: JSON-LD → CSS منصات → Meta → Regex — مع تراجع تكيفي عند الحظر الناعم."""
 
     def __init__(self, concurrency_limit: int = 15):
         self.concurrency_limit = max(1, int(concurrency_limit))
         self.semaphore = asyncio.Semaphore(self.concurrency_limit)
+        self._adaptive_extra_delay = 0.0
+        self._backoff_lock = asyncio.Lock()
 
     def _get_headers(
-        self, referer: Optional[str] = None, user_agent: Optional[str] = None
+        self,
+        referer: Optional[str] = None,
+        user_agent: Optional[str] = None,
+        url: Optional[str] = None,
     ) -> Dict[str, str]:
-        """رؤوس واقعية لتقليل الحظر (Referer + Accept-Encoding + …)."""
-        ref = referer or "https://www.google.com/"
-        ua = (user_agent or _USER_AGENTS[0]).strip()
+        """رؤوس متنوّعة (لغة، مرجع، وكيل) لتقليل بصمة آلية ثابتة."""
+        if referer is not None:
+            ref = referer
+        elif url and random.random() < 0.72:
+            ref = self._referer_for_url(url)
+        else:
+            ref = random.choice(
+                (
+                    "https://www.google.com/",
+                    "https://www.bing.com/",
+                    "https://duckduckgo.com/",
+                )
+            )
+        ua = (user_agent or random.choice(_USER_AGENTS)).strip()
+        accept_lang = random.choice(_ACCEPT_LANGUAGES)
         return {
             "User-Agent": ua,
             "Accept": (
                 "text/html,application/xhtml+xml,application/xml;q=0.9,"
                 "image/avif,image/webp,image/apng,*/*;q=0.8"
             ),
-            "Accept-Language": "ar-SA,ar;q=0.9,en-US;q=0.8,en;q=0.7",
-            # بدون br: aiohttp يحتاج حزمة brotli لفك br؛ gzip/deflate كافٍ لمعظم الخوادم
+            "Accept-Language": accept_lang,
             "Accept-Encoding": "gzip, deflate",
             "Referer": ref,
             "DNT": "1",
@@ -820,42 +998,258 @@ class AsyncCompetitorScraper:
             "sku": sku,
         }
 
-    def _extract_meta_fallback(self, soup: BeautifulSoup, url: str) -> Optional[Dict[str, Any]]:
-        """وسوم meta ثابتة نسبياً (og / product)."""
+    def _meta_extract_name_price_img(self, soup: BeautifulSoup) -> Tuple[str, Optional[float], str]:
+        """اسم + سعر + صورة من meta / title (طبقة وسيطة)."""
         name_el = soup.find("meta", property="og:title") or soup.find(
             "meta", attrs={"name": "twitter:title"}
         )
-        price_el = (
-            soup.find("meta", property="product:price:amount")
-            or soup.find("meta", property="og:price:amount")
-            or soup.find("meta", attrs={"itemprop": "price"})
-        )
-        if not name_el or not name_el.get("content"):
-            if soup.title and soup.title.string:
-                name = str(soup.title.string).strip()
-            else:
-                return None
-        else:
+        name = ""
+        if name_el and name_el.get("content"):
             name = str(name_el["content"]).strip()
+        elif soup.title and soup.title.string:
+            name = str(soup.title.string).strip()
 
-        price = None
-        if price_el and price_el.get("content"):
-            price = _parse_price_from_text(str(price_el["content"]))
-        if price is None:
-            return None
+        price: Optional[float] = None
+        for pel in (
+            soup.find("meta", property="product:price:amount"),
+            soup.find("meta", property="og:price:amount"),
+            soup.find("meta", attrs={"itemprop": "price"}),
+        ):
+            if pel and pel.get("content"):
+                price = _parse_price_from_text(str(pel["content"]))
+                if price is not None:
+                    break
 
         og_img = soup.find("meta", property="og:image")
         image_url = str(og_img["content"]).strip() if og_img and og_img.get("content") else ""
+        return name, price, image_url
 
+    def _classify_soft_block(self, html: str, status: int) -> Tuple[bool, str]:
+        """كشف حظر ناعم: HTML قصير جداً أو صفحات تحقق/حظر."""
+        if status != 200:
+            return False, ""
+        if not html:
+            return True, "empty_html"
+        ln = len(html)
+        if ln < 2048:
+            return True, f"tiny_html_{ln}b_under_2kb"
+        head = html[:12000].lower()
+        keys = (
+            "captcha",
+            "cloudflare",
+            "forbidden",
+            "access denied",
+            "blocked",
+            "robot check",
+            "ddos protection",
+            "attention required",
+            "enable javascript",
+            "حظر",
+            "verify you are human",
+        )
+        if any(k in head for k in keys):
+            return True, "block_keyword_in_body"
+        return False, ""
+
+    def _css_pick_name_price(
+        self, soup: BeautifulSoup, name_sels: List[str], price_sels: List[str]
+    ) -> Tuple[str, Optional[float]]:
+        name = ""
+        for sel in name_sels:
+            try:
+                el = soup.select_one(sel)
+            except Exception:
+                continue
+            if el:
+                t = el.get_text(strip=True) if hasattr(el, "get_text") else ""
+                if t and 1 < len(t) < 800:
+                    name = t[:500]
+                    break
+        price_v: Optional[float] = None
+        for sel in price_sels:
+            try:
+                el = soup.select_one(sel)
+            except Exception:
+                continue
+            if not el:
+                continue
+            raw = (
+                el.get("content")
+                or el.get("data-price")
+                or el.get("data-product-price")
+                or el.get("data-current-price")
+                or el.get("data-price-amount")
+                or (el.get_text(strip=True) if hasattr(el, "get_text") else "")
+            )
+            p = _parse_price_from_text(str(raw or ""))
+            if p is not None and p > 0:
+                price_v = float(p)
+                break
+        return name, price_v
+
+    def _extract_css_layers(self, soup: BeautifulSoup, url: str) -> Optional[Tuple[Dict[str, Any], str]]:
+        host = urlparse(url).netloc.lower()
+        if "shopify" in host or "myshopify" in host:
+            prio = {"css_shopify": 0, "css_salla": 1, "css_zid": 2, "css_schema_generic": 3}
+        elif "zid" in host:
+            prio = {"css_zid": 0, "css_salla": 1, "css_shopify": 2, "css_schema_generic": 3}
+        elif "salla" in host:
+            prio = {"css_salla": 0, "css_zid": 1, "css_shopify": 2, "css_schema_generic": 3}
+        else:
+            prio = {m: i for i, (m, _, _) in enumerate(_HYBRID_CSS_LAYERS)}
+        ordered = sorted(_HYBRID_CSS_LAYERS, key=lambda x: prio.get(x[0], 99))
+
+        for method, ns, ps in ordered:
+            n, p = self._css_pick_name_price(soup, ns, ps)
+            if n and p and p > 0:
+                og_img = soup.find("meta", property="og:image")
+                img = str(og_img["content"]).strip() if og_img and og_img.get("content") else ""
+                return (
+                    {
+                        "name": n,
+                        "price": float(p),
+                        "brand": "",
+                        "image_url": img,
+                        "comp_image_url": img,
+                        "comp_url": url,
+                        "sku": _stable_sku_from_url(url),
+                    },
+                    method,
+                )
+        return None
+
+    def _extract_regex_layer(self, html: str, soup: BeautifulSoup, url: str) -> Optional[Dict[str, Any]]:
+        chunk = html[: min(len(html), 900_000)]
+        found: List[float] = []
+        for rx in (_SAR_PRICE_AFTER, _SAR_PRICE_BEFORE):
+            for m in rx.finditer(chunk):
+                v = _parse_price_from_text(m.group(1))
+                if v is not None and 3.0 < v < 250_000:
+                    found.append(float(v))
+        if not found:
+            for pat in (
+                r'"price"\s*:\s*"?([\d.,]+)"?',
+                r'product:price:amount"\s+content="([\d.,]+)"',
+            ):
+                mm = re.search(pat, chunk, re.I)
+                if mm:
+                    v = _parse_price_from_text(mm.group(1))
+                    if v is not None and 3.0 < v < 250_000:
+                        found.append(float(v))
+        if not found:
+            return None
+        price = max(found)
+        name = ""
+        og = soup.find("meta", property="og:title")
+        if og and og.get("content"):
+            name = str(og["content"]).strip()
+        if not name and soup.title and soup.title.string:
+            name = str(soup.title.string).strip()
+        name = re.split(r"\s*[\-|–|]\s*", name, maxsplit=1)[0].strip()[:400]
+        if not name or len(name) < 2:
+            return None
+        og_img = soup.find("meta", property="og:image")
+        img = str(og_img["content"]).strip() if og_img and og_img.get("content") else ""
         return {
             "name": name,
-            "price": float(price),
+            "price": price,
             "brand": "",
-            "image_url": image_url,
-            "comp_image_url": image_url,
+            "image_url": img,
+            "comp_image_url": img,
             "comp_url": url,
             "sku": _stable_sku_from_url(url),
         }
+
+    def _hybrid_parse_html(self, html: str, url: str) -> Tuple[Optional[Dict[str, Any]], str, str]:
+        """استخراج هجين متعدد الطبقات → (صف، خطأ، طريقة)."""
+        try:
+            soup = BeautifulSoup(html, "html.parser")
+        except Exception as e:
+            return None, f"parse_exc:{type(e).__name__}", ""
+
+        r_ld = self._parse_json_ld_scripts(soup, url)
+        if r_ld and r_ld.get("name"):
+            try:
+                p0 = float(r_ld.get("price", 0) or 0)
+            except (TypeError, ValueError):
+                p0 = 0.0
+            if p0 > 0:
+                r_ld["extraction_method"] = "json_ld"
+                return r_ld, "", "json_ld"
+
+            partial_name = str(r_ld["name"]).strip()
+            partial_brand = str(r_ld.get("brand", "") or "")
+            partial_img = str(r_ld.get("image_url", "") or "")
+            sku_ld = str(r_ld.get("sku") or _stable_sku_from_url(url))
+
+            css_hit = self._extract_css_layers(soup, url)
+            if css_hit:
+                row, method = css_hit
+                row["name"] = row.get("name") or partial_name
+                row["brand"] = row.get("brand") or partial_brand
+                if partial_img and not (row.get("image_url") or "").strip():
+                    row["image_url"] = partial_img
+                    row["comp_image_url"] = partial_img
+                row["sku"] = sku_ld
+                row["extraction_method"] = f"json_ld+{method}"
+                return row, "", row["extraction_method"]
+
+            m_name, m_price, m_img = self._meta_extract_name_price_img(soup)
+            if m_price is not None and m_price > 0:
+                nm = partial_name or m_name
+                if nm:
+                    row = {
+                        "name": nm,
+                        "price": float(m_price),
+                        "brand": partial_brand,
+                        "image_url": (partial_img or m_img or ""),
+                        "comp_image_url": (partial_img or m_img or ""),
+                        "comp_url": url,
+                        "sku": sku_ld,
+                    }
+                    row["extraction_method"] = "json_ld+meta_og"
+                    return row, "", row["extraction_method"]
+
+            rx_row = self._extract_regex_layer(html, soup, url)
+            if rx_row:
+                rx_row["name"] = partial_name or rx_row["name"]
+                rx_row["brand"] = partial_brand or rx_row.get("brand", "")
+                if partial_img and not (rx_row.get("image_url") or "").strip():
+                    rx_row["image_url"] = partial_img
+                    rx_row["comp_image_url"] = partial_img
+                rx_row["sku"] = sku_ld
+                rx_row["extraction_method"] = "json_ld+regex_sar"
+                return rx_row, "", rx_row["extraction_method"]
+
+        m_name, m_price, m_img = self._meta_extract_name_price_img(soup)
+        if m_name and m_price is not None and m_price > 0:
+            row = {
+                "name": m_name,
+                "price": float(m_price),
+                "brand": "",
+                "image_url": m_img,
+                "comp_image_url": m_img,
+                "comp_url": url,
+                "sku": _stable_sku_from_url(url),
+            }
+            row["extraction_method"] = "meta_og"
+            return row, "", "meta_og"
+
+        css_hit = self._extract_css_layers(soup, url)
+        if css_hit:
+            row, method = css_hit
+            row["extraction_method"] = method
+            return row, "", method
+
+        rx_row = self._extract_regex_layer(html, soup, url)
+        if rx_row:
+            rx_row["extraction_method"] = "regex_sar"
+            return rx_row, "", "regex_sar"
+
+        if re.search(r"(captcha|cloudflare|access\.denied|حظر|robot)", html, re.I):
+            return None, "blocked_or_login_page", ""
+
+        return None, "parse_no_layer_matched", ""
 
     def _parse_json_ld_scripts(self, soup: BeautifulSoup, url: str) -> Optional[Dict[str, Any]]:
         scripts = soup.find_all("script", type="application/ld+json")
@@ -875,86 +1269,33 @@ class AsyncCompetitorScraper:
                     return row
         return None
 
-    def _parse_html_to_row(self, html_content: str, url: str) -> Tuple[Optional[Dict[str, Any]], str]:
-        """يحلّل HTML جاهزاً. يعيد (صف أو None, رمز سبب عند الفشل)."""
-        try:
-            soup = BeautifulSoup(html_content, "html.parser")
-
-            row = self._parse_json_ld_scripts(soup, url)
-            if row is not None:
-                return row, ""
-
-            row = self._extract_meta_fallback(soup, url)
-            if row is not None:
-                return row, ""
-
-            for pat in (
-                r'"price"\s*:\s*"?([\d.,]+)"?',
-                r"product:price:amount\"\s+content=\"([\d.,]+)\"",
-            ):
-                mm = re.search(pat, html_content, re.I)
-                if mm:
-                    p = _parse_price_from_text(mm.group(1))
-                    if p is not None:
-                        tit = soup.find("meta", property="og:title")
-                        nm = (
-                            str(tit["content"]).strip()
-                            if tit and tit.get("content")
-                            else (
-                                str(soup.title.string).strip()
-                                if soup.title and soup.title.string
-                                else ""
-                            )
-                        )
-                        if nm:
-                            og_img = soup.find("meta", property="og:image")
-                            image_url = (
-                                str(og_img["content"]).strip()
-                                if og_img and og_img.get("content")
-                                else ""
-                            )
-                            return {
-                                "name": nm,
-                                "price": float(p),
-                                "brand": "",
-                                "image_url": image_url,
-                                "comp_image_url": image_url,
-                                "comp_url": url,
-                                "sku": _stable_sku_from_url(url),
-                            }, ""
-
-            ctype_hint = "blocked_or_login" if re.search(
-                r"(captcha|cloudflare|access.denied|حظر|robot)", html_content, re.I
-            ) else "parse_no_product_json_ld_meta"
-            return None, ctype_hint
-        except Exception as e:
-            logger.error("Error parsing %s: %s", url, e)
-            return None, f"parse_exc:{type(e).__name__}"
-
     async def fetch_and_parse_url(
         self, session: aiohttp.ClientSession, url: str
     ) -> ScrapeAttempt:
-        max_tries = int(os.environ.get("SCRAPER_FETCH_RETRIES", "3"))
-        max_tries = max(1, min(max_tries, 6))
-        min_d = float(os.environ.get("SCRAPER_MIN_DELAY", "0.08"))
-        max_d = float(os.environ.get("SCRAPER_MAX_DELAY", "0.55"))
+        max_tries = int(os.environ.get("SCRAPER_FETCH_RETRIES", "4"))
+        max_tries = max(1, min(max_tries, 7))
+        min_d = float(os.environ.get("SCRAPER_MIN_DELAY", "0.12"))
+        max_d = float(os.environ.get("SCRAPER_MAX_DELAY", "0.85"))
         if max_d < min_d:
             min_d, max_d = max_d, min_d
 
         last_code = "unknown"
         last_detail = ""
+        saw_soft_block = False
 
         for attempt in range(max_tries):
             html_content = ""
             ua = _USER_AGENTS[(attempt + random.randint(0, len(_USER_AGENTS) - 1)) % len(_USER_AGENTS)]
+            async with self._backoff_lock:
+                extra_backoff = self._adaptive_extra_delay
             async with self.semaphore:
-                delay = random.uniform(min_d, max_d)
+                delay = random.uniform(min_d, max_d) + extra_backoff
                 await asyncio.sleep(delay)
                 ref = self._referer_for_url(url)
                 try:
                     async with session.get(
                         url,
-                        headers=self._get_headers(referer=ref, user_agent=ua),
+                        headers=self._get_headers(referer=ref, user_agent=ua, url=url),
                         timeout=aiohttp.ClientTimeout(total=55),
                         allow_redirects=True,
                     ) as response:
@@ -969,7 +1310,11 @@ class AsyncCompetitorScraper:
                         if st in (403, 429, 502, 503):
                             last_code = f"HTTP_{st}"
                             last_detail = (response.reason or "retryable")[:120]
-                            await asyncio.sleep(0.55 * (attempt + 1))
+                            async with self._backoff_lock:
+                                self._adaptive_extra_delay = min(
+                                    self._adaptive_extra_delay + 0.65, 16.0
+                                )
+                            await asyncio.sleep(1.1 + 0.7 * attempt)
                             continue
                         if st == 404:
                             return ScrapeAttempt(
@@ -987,6 +1332,8 @@ class AsyncCompetitorScraper:
                 except asyncio.TimeoutError:
                     last_code = "fetch_timeout"
                     last_detail = f"محاولة {attempt + 1}/{max_tries}"
+                    async with self._backoff_lock:
+                        self._adaptive_extra_delay = min(self._adaptive_extra_delay + 0.35, 14.0)
                     continue
                 except aiohttp.ClientError as e:
                     last_code = f"fetch_{type(e).__name__}"
@@ -1003,13 +1350,43 @@ class AsyncCompetitorScraper:
                 last_detail = f"طول={len(html_content or '')}"
                 continue
 
-            row, perr = self._parse_html_to_row(html_content, url)
+            soft, sreason = self._classify_soft_block(html_content, 200)
+            if soft:
+                saw_soft_block = True
+                last_code = "soft_block"
+                last_detail = sreason
+                async with self._backoff_lock:
+                    self._adaptive_extra_delay = min(self._adaptive_extra_delay + 0.85, 18.0)
+                await asyncio.sleep(1.4 + 0.85 * attempt)
+                continue
+
+            row, perr, method = self._hybrid_parse_html(html_content, url)
             if row is not None:
-                return ScrapeAttempt(True, row=row)
+                async with self._backoff_lock:
+                    self._adaptive_extra_delay = max(
+                        0.0, self._adaptive_extra_delay * 0.86 - 0.06
+                    )
+                ext = str(row.get("extraction_method") or method or "")
+                if saw_soft_block and (
+                    ext.startswith("css_")
+                    or "regex" in ext
+                    or ext.startswith("json_ld+")
+                    or ext == "meta_og"
+                ):
+                    try:
+                        from utils.live_price_store import append_activity_log
+
+                        host = urlparse(url).netloc[:100]
+                        append_activity_log(
+                            f"✅ تعافي استخراج بعد حظر/رد ضعيف: {host} — طبقة {ext}"
+                        )
+                    except Exception:
+                        pass
+                return ScrapeAttempt(True, row=row, extraction_method=ext)
 
             last_code = perr or "parse_no_row"
             last_detail = f"try {attempt + 1}/{max_tries}"
-            await asyncio.sleep(0.12 * (attempt + 1))
+            await asyncio.sleep(0.2 + 0.18 * attempt)
 
         return ScrapeAttempt(False, error_code=last_code, error_detail=last_detail)
 
@@ -1117,9 +1494,11 @@ async def _process_pending_batch(
             continue
         att: ScrapeAttempt = res
         if att.ok and att.row:
-            # ذاكرة حية فورية — قبل SQLite/CSV الدفعي
-            push_scraped_product(att.row)
-            changed, _is_new = _upsert_product_and_get_change(att.row)
+            row_db = dict(att.row)
+            ext_method = str(row_db.pop("extraction_method", "") or att.extraction_method or "")
+            # ذاكرة حية فورية — قبل SQLite/CSV الدفعي (مع طريقة الاستخراج للتشخيص)
+            push_scraped_product(row_db, extraction_method=ext_method)
+            changed, _is_new = _upsert_product_and_get_change(row_db)
             _mark_url_status(url, "completed", "")
             if changed:
                 updated_rows += 1
