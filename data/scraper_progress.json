@@ -1,0 +1,11 @@
+{
+  "running": true,
+  "started_at": "2026-03-28T06:44:28.119973+00:00",
+  "finished_at": null,
+  "last_error": null,
+  "urls_total": 47031,
+  "urls_processed": 0,
+  "rows_in_csv": 0,
+  "current_sitemap": null,
+  "mode": "single_run"
+}
