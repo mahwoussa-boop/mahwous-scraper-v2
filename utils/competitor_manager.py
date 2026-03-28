@@ -5,12 +5,19 @@ import subprocess
 import sys
 import time
 import sqlite3
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import pandas as pd
 import streamlit as st
 
 from config import MAIN_STORE_DOMAIN, MAIN_STORE_NAME, is_main_store_domain
+from utils.scrape_live_cards import (
+    BUCKET_META,
+    bucket_final_priced_df,
+    competitor_missing_vs_our_catalog,
+    summarize_buckets,
+    trim_for_display,
+)
 from utils.sitemap_resolve import resolve_store_to_sitemap_url
 
 _SCRAPER_PROGRESS = os.path.join("data", "scraper_progress.json")
@@ -47,6 +54,34 @@ def _progress_looks_stuck(prog: dict) -> bool:
         if int(prog.get("urls_processed") or 0) == 0 and int(prog.get("urls_total") or 0) == 0:
             return True
     return False
+
+
+def _live_queue_counts_from_db() -> dict | None:
+    """عدادات الطابور الحية من SQLite (أدق من JSON أثناء تنفيذ دفعة طويلة)."""
+    try:
+        db_path = os.path.join(os.getcwd(), "data", "scraper_state.db")
+        if not os.path.exists(db_path):
+            return None
+        conn = sqlite3.connect(db_path)
+        rows = conn.execute(
+            "SELECT status, COUNT(1) FROM url_queue GROUP BY status"
+        ).fetchall()
+        conn.close()
+        q = {"pending": 0, "completed": 0, "failed": 0}
+        for st, cnt in rows:
+            if st in q:
+                q[st] = int(cnt)
+        total = q["pending"] + q["completed"] + q["failed"]
+        handled = q["completed"] + q["failed"]
+        return {
+            "urls_total": total,
+            "urls_processed": handled,
+            "urls_completed": q["completed"],
+            "urls_failed": q["failed"],
+            "urls_pending": q["pending"],
+        }
+    except Exception:
+        return None
 
 
 def _reset_scraper_progress_and_stop_flag() -> None:
@@ -204,10 +239,16 @@ def render_competitor_scrape_page():  # noqa: C901
         "يُجلب أحدث أسعار المنافسين من روابط الـ Sitemap أعلاه. **الكشط يعمل في الخلفية**؛ "
         "سترى تقدّم الطلبات وعدد الصفوف المحفوظة أثناء العمل، ثم الملخص عند الانتهاء."
     )
+    st.caption(
+        "**مراقب الواجهة:** التحديث الفوري هنا يعتمد على ملف `data/scraper_progress.json` + "
+        "`streamlit-autorefresh` (بدون WebSockets). للمزامنة الحقيقية عبر الشبكة يمكن لاحقاً "
+        "إضافة WebSocket أو Firebase كمكوّن منفصل."
+    )
 
     prog_running = False
     prog: dict = {}
     progress_stuck = False
+    stop_flag_present = os.path.exists(STOP_FLAG_PATH)
     if os.path.exists(_SCRAPER_PROGRESS):
         try:
             with open(_SCRAPER_PROGRESS, "r", encoding="utf-8") as _pf:
@@ -216,6 +257,11 @@ def render_competitor_scrape_page():  # noqa: C901
             prog_running = bool(prog.get("running")) and not progress_stuck
         except Exception:
             pass
+
+    user_stopped_reported = (
+        str(prog.get("mode", "")).lower() == "stopped_by_flag"
+        or str(prog.get("last_error", "")) == "stopped_by_user_flag"
+    )
 
     if progress_stuck:
         st.warning(
@@ -231,20 +277,58 @@ def render_competitor_scrape_page():  # noqa: C901
         try:
             from streamlit_autorefresh import st_autorefresh
 
-            st_autorefresh(interval=4000, key="competitor_scrape_autorefresh")
+            st_autorefresh(interval=2500, key="competitor_scrape_autorefresh")
         except ImportError:
             pass
-        st.warning("⏳ جاري سحب البيانات… يُحدَّث العرض كل بضع ثوانٍ حتى يكتمل.")
+        st.warning(
+            "⏳ جاري سحب البيانات… يُحدَّث العرض كل ~2.5 ثانية. "
+            "**أول دفعة** قد تستغرق عدة دقائق (تأخير بين الطلبات + مهلة الشبكة)."
+        )
+        if stop_flag_present:
+            st.error(
+                "🛑 **طلب إيقاف مفعّل** (`scraper_stop.flag`) — ستتوقف الخدمة بعد انتهاء الدفعة الحالية."
+            )
+        live_q = _live_queue_counts_from_db()
+        disp = live_q if live_q else {
+            "urls_total": max(int(prog.get("urls_total", 0) or 0), 1),
+            "urls_processed": int(prog.get("urls_processed", 0) or 0),
+            "urls_completed": int(prog.get("urls_completed", 0) or 0),
+            "urls_failed": int(prog.get("urls_failed", 0) or 0),
+            "urls_pending": int(prog.get("urls_pending", 0) or 0),
+        }
+        total_urls = max(int(disp["urls_total"]), 1)
+        done_urls = min(int(disp["urls_processed"]), total_urls)
+        frac = done_urls / total_urls
+        st.progress(min(1.0, frac))
+        st.caption(
+            f"**تقدّم الطابور:** تم معالجة **{done_urls:,} / {total_urls:,}** رابط منتج "
+            f"(≈ **{frac * 100:.1f}%**) — يُحفظ كل صف فوراً في SQLite ثم يُصدَّر إلى CSV."
+        )
         c1, c2, c3 = st.columns(3)
         with c1:
             st.metric(
-                "تقدّم الطلبات",
-                f"{prog.get('urls_processed', 0):,} / {max(prog.get('urls_total', 0), 1):,}",
+                "روابط مُعالَجة (نجاح + فشل)",
+                f"{disp['urls_processed']:,} / {max(disp['urls_total'], 1):,}",
             )
         with c2:
             st.metric("صفوف محفوظة في CSV", f"{prog.get('rows_in_csv', 0):,}")
         with c3:
-            st.caption(f"Sitemap: `{prog.get('current_sitemap', '—')}`")
+            st.caption(
+                f"✅ مكتمل: **{disp['urls_completed']:,}** · "
+                f"❌ فشل: **{disp['urls_failed']:,}** · "
+                f"⏳ بالانتظار: **{disp['urls_pending']:,}**"
+            )
+            st.caption(f"Sitemap: `{prog.get('current_sitemap', '—')}` · phase: `{prog.get('phase', '—')}`")
+    elif user_stopped_reported or (stop_flag_present and not prog_running):
+        st.error(
+            "🛑 **الكشط متوقف** — إما بأمر المستخدم أو بملف الإيقاف. "
+            "احذف `scraper_stop.flag` إن أردت المتابعة، ثم أعد «بدء جلب بيانات المنافسين»."
+        )
+    elif not progress_stuck and prog and not prog.get("running") and prog.get("finished_at"):
+        st.success(
+            "✅ **آخر دورة كشط انتهت** (حسب `scraper_progress.json`). "
+            "يمكنك مراجعة الملخص والبطاقات أدناه."
+        )
 
     # ── مراقبة + إيقاف تلقائي عند التعطل ─────────────────────────────────
     with st.expander("🛑 مراقبة الكشط (Live) + إيقاف إذا خرب", expanded=False):
@@ -275,7 +359,10 @@ def render_competitor_scrape_page():  # noqa: C901
         else:
             st.success("✅ الخدمة تعمل (إذا كان الكشط متاحًا في الخلفية).")
 
-        current_processed = int(prog.get("urls_processed", 0) or 0)
+        _live = _live_queue_counts_from_db()
+        current_processed = int(
+            (_live or {}).get("urls_processed", prog.get("urls_processed", 0)) or 0
+        )
         now_ts = time.time()
 
         last_processed = st.session_state.get("scraper_last_urls_processed", None)
@@ -340,9 +427,16 @@ def render_competitor_scrape_page():  # noqa: C901
 
     if os.path.exists(STOP_FLAG_PATH):
         st.warning(
-            "⏹️ يوجد ملف **إيقاف الكشط** (`scraper_stop.flag`). "
-            "سيتم حذفه تلقائياً عند الضغط على بدء جلب جديد."
+            "⏹️ يوجد ملف **إيقاف الكشط** (`scraper_stop.flag`) — "
+            "وضع **الخدمة المستمرة** يتوقف عند رؤيته. احذفه قبل أن يُكمِل الكشط دفعات جديدة."
         )
+        if st.button("🗑️ حذف ملف الإيقاف الآن", key="btn_remove_stop_flag_only"):
+            try:
+                os.remove(STOP_FLAG_PATH)
+                st.success("تم حذف `scraper_stop.flag`.")
+                st.rerun()
+            except OSError as e:
+                st.error(f"تعذر الحذف: {e}")
 
     col_btn, col_live = st.columns([1, 2])
     with col_btn:
@@ -448,6 +542,163 @@ def render_competitor_scrape_page():  # noqa: C901
     # ملاحظة: Streamlit سيعيد تشغيل الكود عند أي تفاعل، لذلك يكفي تشغيل المراقبة مرة واحدة لكل تحميل.
     if has_store:
         _live_auto_compare_once()
+
+    st.markdown("### 📡 تدفق الكشط اللحظي (ذاكرة مشتركة)")
+    st.caption(
+        "كل منتج يُكشط بنجاح يُدفع هنا **قبل** اكتمال تصدير `competitors_latest.csv`. "
+        "الفشل: سبب مختصر لكل رابط في الجدول — وفّر `SCRAPER_LOG_EACH_FAILURE=1` لتسجيل كل فشل في سجل النشاط أيضاً."
+    )
+    try:
+        from streamlit import fragment as st_fragment
+        from utils.scrape_live_buffer import snapshot_failures, snapshot_products
+
+        @st_fragment(run_every=timedelta(seconds=2))
+        def _scrape_buffer_fragment():
+            prods = snapshot_products(50)
+            fails = snapshot_failures(40)
+            c1, c2 = st.columns(2)
+            with c1:
+                st.markdown("**✅ آخر نجاحات (الذاكرة)**")
+                if prods:
+                    st.dataframe(pd.DataFrame(prods), use_container_width=True, hide_index=True)
+                else:
+                    st.caption("لا صفوف بعد — مع أول رابط ناجح يظهر الجدول فوراً.")
+            with c2:
+                st.markdown("**📛 آخر فشل + السبب**")
+                if fails:
+                    st.dataframe(pd.DataFrame(fails), use_container_width=True, hide_index=True)
+                else:
+                    st.caption("—")
+
+        _scrape_buffer_fragment()
+    except Exception:
+        try:
+            from utils.scrape_live_buffer import snapshot_failures, snapshot_products
+
+            prods = snapshot_products(50)
+            fails = snapshot_failures(40)
+            st.dataframe(
+                pd.DataFrame(prods) if prods else pd.DataFrame({"msg": ["لا بيانات"]}),
+                use_container_width=True,
+                hide_index=True,
+            )
+            st.dataframe(
+                pd.DataFrame(fails) if fails else pd.DataFrame({"msg": ["لا فشول مسجلة"]}),
+                use_container_width=True,
+                hide_index=True,
+            )
+        except Exception:
+            st.caption("تعذّر تحميل مخزن الكشط الحي.")
+
+    db_path_q = os.path.join(os.getcwd(), "data", "scraper_state.db")
+    if os.path.isfile(db_path_q):
+        with st.expander("🔎 آخر فشل من قاعدة الطابور (url_queue)", expanded=False):
+            try:
+                conn = sqlite3.connect(db_path_q)
+                fail_rows = conn.execute(
+                    """
+                    SELECT url, last_error, attempt_count, updated_at
+                    FROM url_queue
+                    WHERE status='failed' AND IFNULL(last_error,'') != ''
+                    ORDER BY updated_at DESC
+                    LIMIT 80
+                    """
+                ).fetchall()
+                conn.close()
+                if fail_rows:
+                    st.dataframe(
+                        pd.DataFrame(
+                            fail_rows,
+                            columns=["url", "last_error", "attempt_count", "updated_at"],
+                        ),
+                        use_container_width=True,
+                        hide_index=True,
+                    )
+                else:
+                    st.caption("لا صفوف فاشلة مع سبب مخزّن حالياً.")
+            except Exception as e:
+                st.caption(f"تعذّر القراءة: {e}")
+
+    st.markdown("---")
+    st.subheader("🧭 تدفق البيانات وبطاقات التحليل")
+    st.markdown(
+        """
+| المرحلة | الوصف |
+|---------|--------|
+| **1. حفظ مباشر** | كل رابط يُعالَج يُخزَّن في SQLite (`product_state` / `url_queue`) ثم يُصدَّر إلى `competitors_latest.csv`. |
+| **2. Gemini + المطابقة** | بعد دُفعات التحديث يُشغَّل خط التسعير التلقائي: `SmartMatcher` + `GeminiMatchVerifier` للحالات الضبابية + محرك التسعير. |
+| **3. تصنيف البطاقات** | يُعاد تجميع صفوف `final_priced_latest.csv` حسب السعر والثقة (الجدول أدناه). |
+"""
+    )
+    final_priced_path = os.path.join(os.getcwd(), "data", "final_priced_latest.csv")
+    final_meta_path = os.path.join(os.getcwd(), "data", "final_priced_latest_meta.json")
+    meta_txt = ""
+    if os.path.isfile(final_meta_path):
+        try:
+            with open(final_meta_path, "r", encoding="utf-8") as _mf:
+                _fm = json.load(_mf)
+            meta_txt = (
+                f"آخر توليد (UTC): `{_fm.get('generated_at_utc', '—')}` · "
+                f"صفوف: **{_fm.get('rows', 0)}** · السبب: `{_fm.get('reason', '—')}`"
+            )
+        except Exception:
+            pass
+    if meta_txt:
+        st.caption(meta_txt)
+
+    if os.path.isfile(final_priced_path):
+        try:
+            df_fp = pd.read_csv(final_priced_path, encoding="utf-8-sig")
+        except Exception as e:
+            st.warning(f"تعذّر قراءة نتيجة التحليل: {e}")
+            df_fp = pd.DataFrame()
+        if df_fp is not None and not df_fp.empty:
+            buckets = bucket_final_priced_df(df_fp)
+            counts = summarize_buckets(buckets)
+            bcols = st.columns(5)
+            bucket_order = ["higher", "lower", "ok", "missing", "review"]
+            short_lbl = {
+                "higher": "🔴 أعلى",
+                "lower": "🟢 أقل",
+                "ok": "✅ سليم",
+                "missing": "🔍 مفقود",
+                "review": "⚠️ مراجعة",
+            }
+            for i, bid in enumerate(bucket_order):
+                _title, hint, _color = BUCKET_META[bid]
+                with bcols[i]:
+                    st.metric(short_lbl[bid], f"{counts.get(bid, 0):,}")
+                    st.caption(hint[:72] + "…" if len(hint) > 72 else hint)
+            tab_labels = [BUCKET_META[b][0] for b in bucket_order]
+            tabs = st.tabs(tab_labels)
+            for tab, bid in zip(tabs, bucket_order):
+                with tab:
+                    title, desc, _c = BUCKET_META[bid]
+                    st.markdown(f"**{title}** — {desc}")
+                    show = trim_for_display(buckets.get(bid, pd.DataFrame()))
+                    if show.empty:
+                        st.info("لا صفوف في هذا القسم حالياً.")
+                    else:
+                        st.dataframe(show, use_container_width=True, hide_index=True)
+            if has_store and os.path.isfile(os.path.join(os.getcwd(), "data", "competitors_latest.csv")):
+                try:
+                    df_c = pd.read_csv(os.path.join(os.getcwd(), "data", "competitors_latest.csv"), encoding="utf-8-sig")
+                    csv_miss = competitor_missing_vs_our_catalog(df_c, our_df)
+                except Exception:
+                    csv_miss = pd.DataFrame()
+                if csv_miss is not None and not csv_miss.empty:
+                    with st.expander("🔍 تقدير سريع: مفقودات من CSV الكاشط مقابل كتالوج الجلسة", expanded=False):
+                        st.caption(
+                            "يستكمل قسم «منتجات مفقودة» في خط التسعير؛ مفيد قبل اكتمال تشغيل Gemini."
+                        )
+                        st.dataframe(csv_miss, use_container_width=True, hide_index=True)
+        else:
+            st.info("ملف `final_priced_latest.csv` فارغ — انتظر اكتمال دفعة كشط ثم خط التسعير التلقائي.")
+    else:
+        st.warning(
+            "لا يوجد `data/final_priced_latest.csv` بعد. "
+            "يُنشأ تلقائياً عند نجاح **خط التسعير الخلفي** بعد تحديثات الكشط (مع فترة تهدئة ~دقيقتين بين التشغيلات)."
+        )
 
     meta_path = os.path.join(os.getcwd(), "data", "scraper_last_run.json")
     if os.path.exists(meta_path):

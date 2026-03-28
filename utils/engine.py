@@ -186,8 +186,15 @@ _SYN = {
     "جولد":"gold","قولد":"gold",
     "سيلفر":"silver","سيلفير":"silver",
     "نايت":"night","نايث":"night",
-    "داي":"day","دي":"day",
+    "داي":"day",
+    # لا تستبدل «دي» عامة — تُستخدم في «ديور» وفي d'Arpège العربي «دي اربيج»
     "او":"",  # إزالة حروف الربط الزائدة
+    # ── لانفين / اكلت دي اربيج / كابوتين جريس ──
+    "لانفين":"lanvin","لانفان":"lanvin","lanvin":"lanvin",
+    "اكلت":"eclat","إكلات":"eclat","اكلات":"eclat","eclat":"eclat",
+    "اربيج":"arpege","ارپيج":"arpege","اربيجي":"arpege","arpege":"arpege","arpège":"arpege",
+    "كابوتين":"cabotine","كابوتينه":"cabotine","cabotine":"cabotine",
+    "جريس":"gres","غريس":"gres","غريص":"gres","gres":"gres","grès":"gres",
     # ── v26.0: مرادفات إضافية لزيادة الدقة ──
     # أحجام بديلة
     "٥٠":"50","٧٥":"75","١٠٠":"100","١٢٥":"125","١٥٠":"150","٢٠٠":"200",
@@ -1672,17 +1679,29 @@ def find_missing_products(our_df, comp_dfs):
             found, score, reason, variant = _is_same_product(
                 cp, cn, c_brand, c_pline, c_size, c_type, c_gender, c_is_t, c_agg)
 
-            # ── Cross-check الثاني: token_set_ratio المباشر ────────────
+            # ── Cross-check الثاني: fuzzy متعدد (أقل حدة = أقل «مفقود» خاطئ) ──
             if not found:
                 for p in our_items:
-                    direct = fuzz.token_set_ratio(bare_ck, p["bare"])
-                    if direct >= 82:
+                    ts = fuzz.token_set_ratio(bare_ck, p["bare"])
+                    if ts >= 76:
+                        found = True
+                        break
+                    to = fuzz.token_sort_ratio(bare_ck, p["bare"])
+                    if to >= 74:
+                        found = True
+                        break
+                    pr = fuzz.partial_ratio(bare_ck, p["bare"])
+                    if pr >= 78:
+                        found = True
+                        break
+                    nr = fuzz.ratio(cn, p["norm"])
+                    if nr >= 72:
                         found = True
                         break
 
             # ── Cross-check الثالث [v12]: ClusterMatchEngine ──────────
             if not found:
-                _cme_result = _cme.match(cp, c_brand, t_dup=88.0, t_critical=68.0)
+                _cme_result = _cme.match(cp, c_brand, t_dup=82.0, t_critical=62.0)
                 if _cme_result["verdict"] == "مكرر":
                     found = True   # المحرك العنقودي يؤكد وجوده لدينا
                 elif _cme_result["verdict"] == "حرج" and not reason:

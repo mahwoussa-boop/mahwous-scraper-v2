@@ -54,6 +54,43 @@ def _normalize_competitor_csv(df_comp: pd.DataFrame) -> pd.DataFrame:
     return d
 
 
+def load_competitors_latest_for_engine(path: str | None = None):
+    """
+    يقرأ competitors_latest.csv ويُحضّر أعمدة متوافقة مع run_full_analysis / CompIndex
+    (اسم المنتج، السعر، sku إن وُجد).
+    """
+    p = path or os.path.join("data", "competitors_latest.csv")
+    if not os.path.isfile(p):
+        return None, f"الملف غير موجود: {p}"
+    try:
+        raw = pd.read_csv(p, encoding="utf-8-sig")
+    except PermissionError:
+        return (
+            None,
+            "تعذر قراءة الملف (قد يكون مفتوحاً للكتابة أثناء الكشط). انتظر ثوانٍ ثم أعد المحاولة.",
+        )
+    except Exception as e:
+        return None, str(e)
+    if raw is None or raw.empty:
+        return None, "ملف الكشط فارغ — انتظر حتى يُسجّل الكاشط صفوفاً."
+    d = _normalize_competitor_csv(raw)
+    if "اسم المنتج" not in d.columns:
+        if "name" in d.columns:
+            d = d.rename(columns={"name": "اسم المنتج"})
+        elif "الاسم" in d.columns:
+            d = d.rename(columns={"الاسم": "اسم المنتج"})
+    if "اسم المنتج" not in d.columns:
+        return None, "ملف الكشط لا يحتوي عمود اسم منتج (الاسم / name)."
+    if "السعر" not in d.columns:
+        if "price" in d.columns:
+            d["السعر"] = pd.to_numeric(d["price"], errors="coerce").fillna(0.0)
+        elif "comp_price" in d.columns:
+            d["السعر"] = pd.to_numeric(d["comp_price"], errors="coerce").fillna(0.0)
+        else:
+            return None, "ملف الكشط لا يحتوي عمود سعر."
+    return d, None
+
+
 def run_full_pricing_pipeline(df_mine: pd.DataFrame) -> pd.DataFrame:
     """
     هذا هو القلب النابض للنظام (Data Fusion).
@@ -161,10 +198,21 @@ def run_full_pricing_pipeline(df_mine: pd.DataFrame) -> pd.DataFrame:
     missing_rows = pd.DataFrame()
     if doubtful_mask.any():
         idxs = final_df.index[doubtful_mask].tolist()
+        _gemini_log_n = 0
         for idx in idxs:
             row = final_df.loc[idx]
             mah_name = str(row.get("name", "") or "")
             comp_name = str(row.get("comp_name", row.get("name_comp", "")) or "")
+            if _gemini_log_n < 12:
+                try:
+                    from utils.live_price_store import append_activity_log
+
+                    append_activity_log(
+                        f"🤖 Gemini: فحص مطابقة «{mah_name[:70]}» ↔ «{comp_name[:50]}»"
+                    )
+                    _gemini_log_n += 1
+                except Exception:
+                    pass
             vr = verifier.verify_perfume_match(mah_name, comp_name)
             is_match = bool(vr.get("is_match", False))
             conf = int(vr.get("confidence", 0) or 0)
@@ -302,6 +350,13 @@ def run_auto_pricing_pipeline_background(reason: str = "", changed_rows: int = 0
         if priced_df is None or priced_df.empty:
             return False
 
+        try:
+            from utils.scrape_live_buffer import replace_pricing_preview
+
+            replace_pricing_preview(priced_df)
+        except Exception:
+            pass
+
         os.makedirs("data", exist_ok=True)
         out_csv = "data/final_priced_latest.csv"
         out_meta = "data/final_priced_latest_meta.json"
@@ -326,6 +381,15 @@ def run_auto_pricing_pipeline_background(reason: str = "", changed_rows: int = 0
             reason,
             changed_rows,
         )
+        try:
+            from utils.live_price_store import append_activity_log, sync_from_final_priced_csv
+
+            append_activity_log(
+                f"📊 اكتمل خط التسعير التلقائي — {len(priced_df)} صف (سبب: {reason or 'auto'})"
+            )
+            sync_from_final_priced_csv()
+        except Exception as le:
+            logger.debug("live_price_store sync skipped: %s", le)
         return True
     except Exception as e:
         logger.error("Auto pricing pipeline failed: %s", e)
