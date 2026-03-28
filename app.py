@@ -164,7 +164,7 @@ def _autoload_internal_store_catalog(show_message: bool = False) -> None:
         return
     if os.path.exists(INTERNAL_STORE_PATH):
         try:
-            _loaded = pd.read_csv(INTERNAL_STORE_PATH)
+            _loaded = pd.read_csv(INTERNAL_STORE_PATH, encoding='utf-8-sig')
             if isinstance(_loaded, pd.DataFrame) and not _loaded.empty:
                 st.session_state.store_df = _loaded
                 st.session_state.our_df = _loaded

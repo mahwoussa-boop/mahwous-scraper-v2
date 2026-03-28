@@ -18,6 +18,7 @@ data/scraper_last_run.json
 data/final_priced_latest.csv
 data/final_priced_latest_meta.json
 !data/.gitkeep
+!data/mahwous_catalog.csv
 
 # سجلات وأدوات
 *.log
