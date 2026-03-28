@@ -22,6 +22,58 @@ PRIMARY_STORE_SITEMAP = "https://mahwous.com/sitemap.xml"
 PRIMARY_STORE_LABEL = "مهووس — متجرنا"
 
 
+def _parse_progress_started_at(prog: dict):
+    raw = prog.get("started_at") if isinstance(prog, dict) else None
+    if not raw:
+        return None
+    try:
+        s = str(raw).replace("Z", "+00:00")
+        return datetime.fromisoformat(s)
+    except Exception:
+        return None
+
+
+def _progress_looks_stuck(prog: dict) -> bool:
+    """جلسة كشط توقفت دون تحديث الملف (إغلاق عملية، تعطل، إلخ)."""
+    if not isinstance(prog, dict) or not prog.get("running"):
+        return False
+    started = _parse_progress_started_at(prog)
+    if started is None:
+        return True
+    age = datetime.now(timezone.utc) - started
+    if age.total_seconds() > 6 * 3600:
+        return True
+    if age.total_seconds() > 45 * 60:
+        if int(prog.get("urls_processed") or 0) == 0 and int(prog.get("urls_total") or 0) == 0:
+            return True
+    return False
+
+
+def _reset_scraper_progress_and_stop_flag() -> None:
+    os.makedirs("data", exist_ok=True)
+    payload = {
+        "running": False,
+        "started_at": None,
+        "finished_at": datetime.now(timezone.utc).isoformat(),
+        "last_error": None,
+        "urls_total": 0,
+        "urls_processed": 0,
+        "rows_in_csv": 0,
+        "current_sitemap": None,
+        "mode": "idle",
+    }
+    try:
+        with open(_SCRAPER_PROGRESS, "w", encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=False, indent=4)
+    except Exception:
+        pass
+    try:
+        if os.path.exists(STOP_FLAG_PATH):
+            os.remove(STOP_FLAG_PATH)
+    except Exception:
+        pass
+
+
 def load_competitors():
     if not os.path.exists('data'):
         os.makedirs('data')
@@ -155,13 +207,25 @@ def render_competitor_scrape_page():  # noqa: C901
 
     prog_running = False
     prog: dict = {}
+    progress_stuck = False
     if os.path.exists(_SCRAPER_PROGRESS):
         try:
             with open(_SCRAPER_PROGRESS, "r", encoding="utf-8") as _pf:
                 prog = json.load(_pf)
-            prog_running = bool(prog.get("running"))
+            progress_stuck = _progress_looks_stuck(prog)
+            prog_running = bool(prog.get("running")) and not progress_stuck
         except Exception:
             pass
+
+    if progress_stuck:
+        st.warning(
+            "⚠️ **حالة كشط عالقة** من جلسة سابقة (العملية انتهت دون تحديث الملف). "
+            "اضغط الزر ثم أعد «بدء جلب بيانات المنافسين»."
+        )
+        if st.button("🔄 إصلاح الحالة العالقة", key="btn_reset_stuck_scraper"):
+            _reset_scraper_progress_and_stop_flag()
+            st.success("تمت إعادة التعيين.")
+            st.rerun()
 
     if prog_running:
         try:
@@ -269,17 +333,32 @@ def render_competitor_scrape_page():  # noqa: C901
     our_df = getattr(st.session_state, "our_df", None)
     has_store = isinstance(our_df, pd.DataFrame) and not our_df.empty
     if not has_store:
-        st.error("⚠️ يرجى رفع ملف متجر مهووس الأساسي أولاً لتتم المقارنة التلقائية.")
+        st.info(
+            "ℹ️ **بلا كتالوج محمّل في الجلسة:** يمكنك تشغيل الكشط؛ "
+            "أما جدول «مفقود مقابل مهووس» ف يحتاج رفع ملف من «📂 رفع الملفات» أو وجود `data/mahwous_catalog.csv`."
+        )
+
+    if os.path.exists(STOP_FLAG_PATH):
+        st.warning(
+            "⏹️ يوجد ملف **إيقاف الكشط** (`scraper_stop.flag`). "
+            "سيتم حذفه تلقائياً عند الضغط على بدء جلب جديد."
+        )
 
     col_btn, col_live = st.columns([1, 2])
     with col_btn:
-        start_disabled = prog_running or not has_store or os.path.exists(STOP_FLAG_PATH)
+        start_disabled = prog_running
         if st.button(
             "🚀 بدء جلب بيانات المنافسين الآن",
             use_container_width=True,
             disabled=start_disabled,
             key="btn_start_scrape_page",
         ):
+            try:
+                if os.path.exists(STOP_FLAG_PATH):
+                    os.remove(STOP_FLAG_PATH)
+            except OSError as e:
+                st.error(f"تعذر إزالة ملف الإيقاف: {e}")
+                st.stop()
             # تشغيل الكاشط في عملية خلفية غير حاجبة
             cmd = [sys.executable, os.path.join(os.getcwd(), "run_background_worker.py")]
             try:
