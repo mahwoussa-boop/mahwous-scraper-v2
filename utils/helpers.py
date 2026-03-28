@@ -429,3 +429,18 @@ def filter_by_column_value(df: pd.DataFrame, column: str, value: Any) -> pd.Data
         return df[df[column].astype(str) == str(value)]
     except:
         return df
+
+def make_columns_unique(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Renames duplicate columns in a DataFrame to make them unique.
+    Appends a suffix like '_1', '_2' to duplicate column names.
+    """
+    cols = pd.Series(df.columns)
+    for dup in cols[cols.duplicated()].unique():
+        # Get all indices of the duplicate column
+        indices = cols[cols == dup].index.tolist()
+        for i, idx in enumerate(indices):
+            if i > 0: # Only rename subsequent duplicates
+                cols[idx] = f"{dup}_{i}"
+    df.columns = cols
+    return df

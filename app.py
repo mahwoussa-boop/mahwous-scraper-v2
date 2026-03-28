@@ -60,7 +60,7 @@ from engines.automation import (AutomationEngine, ScheduledSearchManager,
 from utils.db_manager import check_strict_duplicate
 from utils.helpers import (apply_filters, get_filter_options, export_to_excel,
                             export_multiple_sheets, parse_pasted_text,
-                            safe_float, format_price, format_diff)
+                            safe_float, format_price, format_diff, make_columns_unique)
 try:
     from utils.make_helper import (send_price_updates, send_new_products,
                                     send_missing_products, send_single_product,
@@ -1507,10 +1507,13 @@ elif page == "🏢 كشط المنافسين":
             _show_cols = [c for c in _preferred_cols if c in our_df.columns]
             if _show_cols:
                 # إزالة التكرار مع الحفاظ على ترتيب العرض
-                _show_cols = list(dict.fromkeys(_show_cols))
-                st.dataframe(our_df[_show_cols], use_container_width=True)
+                # Make columns unique before displaying to avoid ValueError
+                display_df = make_columns_unique(our_df[_show_cols].copy())
+                st.dataframe(display_df, use_container_width=True)
             else:
-                st.dataframe(our_df, use_container_width=True)
+                # Make columns unique before displaying to avoid ValueError
+                display_df = make_columns_unique(our_df.copy())
+                st.dataframe(display_df, use_container_width=True)
     render_competitor_scrape_page()
 
 
