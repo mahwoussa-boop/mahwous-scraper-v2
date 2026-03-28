@@ -287,6 +287,11 @@ def _score_csv_decoding(df):
         t = str(c)
         if "\ufffd" in t:
             score -= 500
+        # معاقبة شديدة: علامة قراءة UTF-8 بترميز خاطئ (ï»¿ أو Ø أو Ù أو طبظي)
+        if ("\u00ef\u00bb" in t or "ï»" in t
+                or t.startswith("Ø") or t.startswith("Ù")
+                or "\u0637\u0628" in t or "\u0638\u064a" in t):
+            score -= 3000
         score += sum(1 for ch in t if "\u0600" <= ch <= "\u06ff") * 3
     for col in list(df.columns)[:8]:
         try:
@@ -296,6 +301,9 @@ def _score_csv_decoding(df):
             continue
         if "\ufffd" in blob:
             score -= 200
+        # معاقبة إضافية إذا كانت بيانات العمود تحتوي على أنماط مشوهة
+        if "\u00d8" in blob or "\u00d9" in blob or "\u0637\u0628" in blob:
+            score -= 1000
         score += min(sum(1 for ch in blob if "\u0600" <= ch <= "\u06ff"), 400)
     score += min(len(df), 50_000) // 100
     return score
