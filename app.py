@@ -91,6 +91,7 @@ from utils.db_manager import (init_db, log_event, log_decision,
                                clear_missing_from_last_job,
                                save_hidden_product, get_hidden_product_keys,
                                init_db_v26, upsert_our_catalog, upsert_comp_catalog,
+                               replace_our_catalog_from_dataframe,
                                save_processed, get_processed, undo_processed,
                                get_processed_keys, migrate_db_v26)
 
@@ -98,13 +99,110 @@ INTERNAL_STORE_PATH = os.path.join("data", "mahwous_catalog.csv")
 
 # ── إعداد الصفحة ──────────────────────────
 logger = logging.getLogger(__name__)
+
+
+def _bootstrap_our_catalog_if_sparse() -> None:
+    """
+    إن كان our_catalog قليل الصفوف (<10): يحاول بالترتيب
+    1) mahwous_catalog.csv (مع تجاهل أسطر تالفة)
+    2) جدول product_state في data/scraper_state.db
+    """
+    try:
+        import sqlite3
+
+        from engines.engine import apply_column_mapping, guess_default_columns
+        from utils.db_manager import DB_PATH, replace_our_catalog_from_dataframe
+
+        if not os.path.isfile(DB_PATH):
+            return
+        conn = sqlite3.connect(DB_PATH, timeout=30)
+        try:
+            cnt = int(conn.execute("SELECT COUNT(*) FROM our_catalog").fetchone()[0])
+        except Exception:
+            conn.close()
+            return
+        conn.close()
+        if cnt >= 10:
+            return
+
+        _bdf = None
+        _source = ""
+
+        if os.path.isfile(INTERNAL_STORE_PATH):
+            try:
+                _bdf = pd.read_csv(
+                    INTERNAL_STORE_PATH,
+                    encoding="utf-8-sig",
+                    low_memory=False,
+                    on_bad_lines="skip",
+                )
+                _source = INTERNAL_STORE_PATH
+            except TypeError:
+                try:
+                    _bdf = pd.read_csv(
+                        INTERNAL_STORE_PATH, encoding="utf-8-sig", low_memory=False
+                    )
+                    _source = INTERNAL_STORE_PATH
+                except Exception:
+                    _bdf = None
+            except Exception:
+                _bdf = None
+
+        if _bdf is None or _bdf.empty or len(_bdf) < 3:
+            scraper_db = os.path.join("data", "scraper_state.db")
+            if os.path.isfile(scraper_db):
+                try:
+                    conn2 = sqlite3.connect(scraper_db, timeout=30)
+                    _bdf = pd.read_sql_query(
+                        """
+                        SELECT
+                            name AS "اسم المنتج",
+                            price AS "السعر",
+                            brand AS "الماركة",
+                            sku AS "رمز المنتج sku",
+                            image_url AS "صورة المنتج"
+                        FROM product_state
+                        WHERE name IS NOT NULL AND name != ''
+                        """,
+                        conn2,
+                    )
+                    conn2.close()
+                    _source = "product_state"
+                    logger.info(
+                        "Bootstrap: قراءة %s صفاً من product_state", len(_bdf)
+                    )
+                except Exception as ex2:
+                    logger.warning("Bootstrap product_state failed: %s", ex2)
+                    _bdf = None
+
+        if _bdf is None or _bdf.empty or len(_bdf) < 3:
+            return
+
+        _gn, _gp, _gi = guess_default_columns(_bdf)
+        _bdf2 = apply_column_mapping(_bdf, _gn, _gp, _gi)
+        result = replace_our_catalog_from_dataframe(_bdf2)
+        logger.info(
+            "Bootstrapped our_catalog: %s rows inserted (source=%s)",
+            result.get("inserted", 0),
+            _source or "unknown",
+        )
+    except Exception as ex:
+        logger.warning("catalog bootstrap skipped: %s", ex)
 st.set_option("client.showErrorDetails", False)
 st.set_page_config(page_title=APP_TITLE, page_icon=APP_ICON,
                    layout="wide", initial_sidebar_state="expanded")
 st.markdown(get_styles(), unsafe_allow_html=True)
 st.markdown(get_sidebar_toggle_js(), unsafe_allow_html=True)
 st.markdown(
-    "<h1 style='margin:0 0 8px 0;color:#00C853;'>Mahwous.com - Smart Pricing Dashboard</h1>",
+    """
+    <style>
+    /* تقليل الهوامش العلوية — مساحة أكبر للبيانات */
+    .block-container { padding-top: 0.75rem !important; padding-bottom: 1rem !important; }
+    header[data-testid="stHeader"] { height: 2.75rem; }
+    div[data-testid="stToolbar"] { top: 0.25rem; }
+    #MainMenu { visibility: visible; }
+    </style>
+    """,
     unsafe_allow_html=True,
 )
 if BASELINE_LOCKED:
@@ -120,6 +218,11 @@ if "db_initialized" not in st.session_state:
         st.session_state["db_initialized"] = True
     except Exception as e:
         st.error(f"Database Initialization Error: {e}")
+
+if "catalog_bootstrapped" not in st.session_state:
+    st.session_state["catalog_bootstrapped"] = True
+    if st.session_state.get("db_initialized"):
+        _bootstrap_our_catalog_if_sparse()
 
 # ── Session State ─────────────────────────
 _defaults = {
@@ -141,7 +244,6 @@ for k, v in _defaults.items():
 # تحميل المنتجات المخفية من قاعدة البيانات عند كل تشغيل
 _db_hidden = get_hidden_product_keys()
 st.session_state.hidden_products = st.session_state.hidden_products | _db_hidden
-
 
 def _autoload_internal_store_catalog(show_message: bool = False) -> None:
     """تحميل كتالوج متجر مهووس الداخلي تلقائياً وربطه بـ our_df/store_df."""
@@ -415,6 +517,227 @@ def _normalize_missing_df_for_ui(df: pd.DataFrame) -> pd.DataFrame:
     return o
 
 
+def _read_csv_robust(path: str) -> pd.DataFrame:
+    """UTF-8-SIG + تجاهل أسطر تالفة. لا يُستخدم errors= (غير مدعوم في read_csv)."""
+    base_kw = {"encoding": "utf-8-sig", "low_memory": False}
+    try:
+        return pd.read_csv(path, **base_kw, on_bad_lines="skip")
+    except TypeError:
+        try:
+            return pd.read_csv(path, **base_kw, error_bad_lines=False, warn_bad_lines=False)
+        except TypeError:
+            return pd.read_csv(path, **base_kw)
+    except Exception:
+        try:
+            return pd.read_csv(path, encoding="utf-8", low_memory=False, on_bad_lines="skip")
+        except TypeError:
+            return pd.read_csv(path, encoding="utf-8", low_memory=False)
+
+
+def render_pricing_detail_panel() -> None:
+    """
+    تبويبات التسعير (بطاقات + مزامنة Make + تصدير سلة).
+    تُستدعى من لوحة التحكم — كانت معزولة سابقاً في فرع «لوحة التسعير» غير المreachable.
+    """
+    _auto_priced_path = os.path.join(os.getcwd(), "data", "final_priced_latest.csv")
+    df = st.session_state.get("final_priced_df")
+    if not isinstance(df, pd.DataFrame) or df.empty:
+        if os.path.exists(_auto_priced_path):
+            try:
+                df = _read_csv_robust(_auto_priced_path)
+                if df is not None and not df.empty:
+                    st.session_state["final_priced_df"] = df
+            except Exception as _e:
+                st.warning(f"تعذر تحميل نتائج التسعير: {_e}")
+                return
+    if not isinstance(df, pd.DataFrame) or df.empty:
+        return
+
+    from utils.ui_components import render_product_cards
+
+    try:
+        work = df.copy()
+        if "sent_to_make_keys" not in st.session_state:
+            st.session_state["sent_to_make_keys"] = set()
+
+        for c in ("price", "comp_price", "suggested_price", "match_score"):
+            if c not in work.columns:
+                work[c] = 0.0
+            work[c] = pd.to_numeric(work[c], errors="coerce").fillna(0.0)
+
+        if "status" not in work.columns:
+            work["status"] = ""
+        work["status"] = work["status"].fillna("").astype(str)
+
+        sent_keys = {str(x) for x in st.session_state.get("sent_to_make_keys", set())}
+        row_keys = work.get("sku", work.get("name", pd.Series([""] * len(work), index=work.index))).astype(str)
+        work.loc[row_keys.isin(sent_keys), "status"] = "sent_to_make"
+
+        group_key_col = "sku" if "sku" in work.columns else "name"
+        work["_group_key"] = work[group_key_col].astype(str).fillna("").str.strip()
+        work.loc[work["_group_key"].isin(["", "N/A", "nan", "None"]), "_group_key"] = (
+            work.get("name", pd.Series(["N/A"] * len(work), index=work.index)).astype(str).str.strip()
+        )
+
+        work["min_comp_price"] = work.groupby("_group_key", dropna=False)["comp_price"].transform("min")
+        work["min_comp_price"] = pd.to_numeric(work["min_comp_price"], errors="coerce").fillna(0.0)
+
+        rel_diff = (
+            (work["price"] - work["min_comp_price"]).abs()
+            / work["min_comp_price"].replace(0, pd.NA)
+        ).fillna(999.0)
+        status_l = work["status"].str.lower()
+        valid_comp = work["min_comp_price"] > 0
+        mask_verified_missing = status_l.eq("missing_after_verification")
+        mask_processed = status_l.eq("sent_to_make")
+        mask_mb_suspect = (
+            work["mb_suspect"].fillna(False).astype(bool)
+            if "mb_suspect" in work.columns
+            else pd.Series(False, index=work.index)
+        )
+        meaningful_match = work["match_score"] > 0
+        mask_review = (~mask_verified_missing) & (
+            status_l.isin({"processing", "under_review"})
+            | (meaningful_match & (work["match_score"] < 80))
+            | mask_mb_suspect
+        )
+        mask_higher = (~mask_verified_missing & ~mask_processed & ~mask_review & valid_comp & (work["price"] > work["min_comp_price"]))
+        mask_lower = (~mask_verified_missing & ~mask_processed & ~mask_review & valid_comp & (work["price"] < work["min_comp_price"]))
+        mask_approved = (~mask_verified_missing & ~mask_processed & ~mask_review & valid_comp & (rel_diff <= 0.02))
+
+        missing_df = pd.DataFrame()
+        comp_csv = os.path.join(os.getcwd(), "data", "competitors_latest.csv")
+        if os.path.exists(comp_csv):
+            try:
+                comp_raw = _read_csv_robust(comp_csv)
+                rename_map = {
+                    "الاسم": "name",
+                    "السعر": "comp_price",
+                    "الماركة": "brand",
+                    "رابط_الصورة": "comp_image_url",
+                    "رابط_المنتج": "comp_url",
+                    "المنافس": "competitor_name",
+                }
+                for ar, en in rename_map.items():
+                    if ar in comp_raw.columns and en not in comp_raw.columns:
+                        comp_raw[en] = comp_raw[ar]
+                if "name" not in comp_raw.columns:
+                    comp_raw["name"] = "N/A"
+                if "sku" not in comp_raw.columns:
+                    comp_raw["sku"] = ""
+                if "comp_image_url" not in comp_raw.columns and "image_url" in comp_raw.columns:
+                    comp_raw["comp_image_url"] = comp_raw["image_url"]
+                if "competitor_name" not in comp_raw.columns:
+                    comp_raw["competitor_name"] = (
+                        comp_raw.get("comp_url", pd.Series([""] * len(comp_raw), index=comp_raw.index))
+                        .astype(str)
+                        .str.extract(r"https?://([^/]+)", expand=False)
+                        .fillna("Competitor")
+                    )
+                comp_raw["comp_price"] = pd.to_numeric(comp_raw.get("comp_price", 0), errors="coerce").fillna(0.0)
+                comp_raw["sku"] = comp_raw["sku"].astype(str).fillna("").str.strip()
+                comp_raw["name"] = comp_raw["name"].astype(str).fillna("").str.strip()
+
+                mah_skus = set(work.get("sku", pd.Series(dtype=str)).astype(str).str.strip().tolist())
+                mah_names = set(work.get("name", pd.Series(dtype=str)).astype(str).str.strip().tolist())
+                miss_mask = (~comp_raw["sku"].isin(mah_skus)) & (~comp_raw["name"].isin(mah_names))
+                missing_df = comp_raw.loc[miss_mask].copy()
+                missing_df["price"] = pd.NA
+                missing_df["suggested_price"] = 0.0
+                missing_df["is_missing"] = True
+                missing_df["status"] = "missing"
+            except Exception:
+                missing_df = pd.DataFrame()
+
+        df_higher = work[mask_higher].copy()
+        df_lower = work[mask_lower].copy()
+        df_approved = work[mask_approved].copy()
+        df_review = work[mask_review].copy()
+        df_processed = work[mask_processed].copy()
+        verified_missing_df = work[mask_verified_missing].copy()
+        if not verified_missing_df.empty:
+            verified_missing_df["is_missing"] = True
+            if "comp_name" in verified_missing_df.columns and "competitor_name" not in verified_missing_df.columns:
+                verified_missing_df["competitor_name"] = verified_missing_df["comp_name"]
+            if "comp_image_url" in verified_missing_df.columns and "image_url" not in verified_missing_df.columns:
+                verified_missing_df["image_url"] = verified_missing_df["comp_image_url"]
+            if missing_df.empty:
+                missing_df = verified_missing_df
+            else:
+                missing_df = pd.concat([missing_df, verified_missing_df], ignore_index=True, sort=False)
+
+        st.markdown("### 📑 مسار التسعير والقرارات")
+        st.caption(
+            f"خط الأساس: **{MAIN_STORE_NAME}** — مقارنة بأدنى سعر منافس لكل SKU/اسم."
+        )
+
+        sync_df = pd.concat([df_higher, df_lower, df_approved], ignore_index=True, sort=False)
+        if not sync_df.empty and "sku" in sync_df.columns:
+            sync_df = sync_df.drop_duplicates(subset=["sku"], keep="last")
+        st.markdown("#### 🚀 اعتماد ومزامنة الأسعار")
+        sync_disabled = bool(st.session_state.get("pricing_sync_in_progress", False)) or sync_df.empty
+        if st.button(
+            f"🚀 اعتماد ومزامنة الأسعار إلى سلة ({len(sync_df)})",
+            key="btn_approve_sync_salla_make_dash",
+            type="primary",
+            disabled=sync_disabled,
+            width="stretch",
+        ):
+            st.session_state["pricing_sync_in_progress"] = True
+            try:
+                with st.spinner("جاري إرسال البيانات إلى متجر سلة عبر Make.com..."):
+                    ok = send_approved_prices_to_make(sync_df)
+                if ok:
+                    sent_skus = set(sync_df["sku"].astype(str).tolist()) if "sku" in sync_df.columns else set()
+                    base_df = st.session_state.get("final_priced_df")
+                    if isinstance(base_df, pd.DataFrame) and not base_df.empty and sent_skus:
+                        base_df = base_df.copy()
+                        if "status" not in base_df.columns:
+                            base_df["status"] = ""
+                        _m = base_df["sku"].astype(str).isin(sent_skus) if "sku" in base_df.columns else pd.Series([False] * len(base_df), index=base_df.index)
+                        base_df.loc[_m, "status"] = "sent_to_make"
+                        st.session_state["final_priced_df"] = base_df
+                        st.session_state["sent_to_make_keys"] = st.session_state.get("sent_to_make_keys", set()) | sent_skus
+                    st.toast("تم تحديث الأسعار بنجاح! 🚀", icon="✅")
+                    st.session_state["pricing_sync_in_progress"] = False
+                    st.rerun()
+                else:
+                    st.error("فشل إرسال الأسعار إلى Make.com. تحقق من Webhook والاتصال.")
+            except Exception as _sync_e:
+                logger.exception("Pricing sync to Make failed")
+                st.error(f"حدث خطأ أثناء المزامنة: {_sync_e}")
+            finally:
+                st.session_state["pricing_sync_in_progress"] = False
+
+        tabs = st.tabs(
+            [
+                "🔴 سعر أعلى",
+                "🟢 سعر أقل",
+                "✅ موافق عليها",
+                "🔍 منتجات مفقودة",
+                "⚠️ تحت المراجعة",
+                "✔️ تمت المعالجة",
+            ]
+        )
+        with tabs[0]:
+            render_product_cards(df_higher, key_prefix="dash_higher", compact=True)
+        with tabs[1]:
+            render_product_cards(df_lower, key_prefix="dash_lower", compact=True)
+        with tabs[2]:
+            render_product_cards(df_approved, key_prefix="dash_approved", compact=True)
+        with tabs[3]:
+            render_product_cards(missing_df, key_prefix="dash_missing", compact=True)
+        with tabs[4]:
+            render_product_cards(df_review, key_prefix="dash_review", compact=True)
+        with tabs[5]:
+            render_product_cards(df_processed, key_prefix="dash_processed", compact=True)
+            st.divider()
+            render_salla_export_ui(df_processed, missing_df=missing_df)
+    except Exception as e:
+        logger.exception("Pricing detail panel: %s", e)
+        st.error(f"تعذر عرض لوحة التسعير التفصيلية: {type(e).__name__}: {str(e)[:200]}")
+
+
 def _auto_refresh_results_from_background_files() -> bool:
     """
     يوزّع المنتجات تلقائياً من ملفات الخلفية الجاهزة (بدون رفع يدوي):
@@ -427,7 +750,7 @@ def _auto_refresh_results_from_background_files() -> bool:
         # fallback: وزّع على الأقل المفقودات من ملف المنافسين حتى لا تبقى الأقسام صفراً
         if os.path.exists(comp_csv):
             try:
-                comp_raw = pd.read_csv(comp_csv)
+                comp_raw = _read_csv_robust(comp_csv)
                 if comp_raw.empty:
                     return False
                 rename_map = {
@@ -462,7 +785,7 @@ def _auto_refresh_results_from_background_files() -> bool:
                 return False
         return False
     try:
-        work = pd.read_csv(priced_path)
+        work = _read_csv_robust(priced_path)
         if work is None or work.empty:
             return False
         for c in ("price", "comp_price", "suggested_price", "match_score"):
@@ -489,14 +812,24 @@ def _auto_refresh_results_from_background_files() -> bool:
         valid_comp = work["min_comp_price"] > 0
         mask_missing = status_l.eq("missing_after_verification")
         mask_processed = status_l.eq("sent_to_make")
-        mask_review = (~mask_missing) & (status_l.isin({"processing", "under_review"}) | (work["match_score"] < 80))
+        mask_mb_suspect = (
+            work["mb_suspect"].fillna(False).astype(bool)
+            if "mb_suspect" in work.columns
+            else pd.Series(False, index=work.index)
+        )
+        meaningful_match = work["match_score"] > 0
+        mask_review = (~mask_missing) & (
+            status_l.isin({"processing", "under_review"})
+            | (meaningful_match & (work["match_score"] < 80))
+            | mask_mb_suspect
+        )
         mask_higher = (~mask_missing & ~mask_processed & ~mask_review & valid_comp & (work["price"] > work["min_comp_price"]))
         mask_lower = (~mask_missing & ~mask_processed & ~mask_review & valid_comp & (work["price"] < work["min_comp_price"]))
         mask_approved = (~mask_missing & ~mask_processed & ~mask_review & valid_comp & (rel_diff <= 0.02))
 
         missing_df = work[mask_missing].copy()
         if os.path.exists(comp_csv):
-            comp_raw = pd.read_csv(comp_csv)
+            comp_raw = _read_csv_robust(comp_csv)
             rename_map = {"الاسم": "name", "sku": "sku"}
             for k, v in rename_map.items():
                 if k in comp_raw.columns and v not in comp_raw.columns:
@@ -1484,8 +1817,35 @@ def render_smart_decision_table(df: pd.DataFrame) -> None:
 # ════════════════════════════════════════════════
 if page == "📊 لوحة التحكم":
     st.header("📊 لوحة التحكم")
-    st.caption("تم دمج عرض لوحة التسعير داخل لوحة التحكم لتفادي التكرار في القائمة الجانبية.")
+    st.caption("نقطة البداية: ملخص المتجر، ثم مسار التسعير والتصدير في الأسفل.")
     db_log("dashboard", "view")
+    _our_df_dash = st.session_state.get("our_df")
+    _n_our = len(_our_df_dash) if isinstance(_our_df_dash, pd.DataFrame) and not _our_df_dash.empty else 0
+    _comp_json = os.path.join(os.getcwd(), "data", "competitors_list.json")
+    _n_comp = 0
+    if os.path.isfile(_comp_json):
+        try:
+            import json as _json
+
+            with open(_comp_json, "r", encoding="utf-8") as _cf:
+                _raw = _json.load(_cf)
+            if isinstance(_raw, list):
+                _n_comp = len(_raw)
+            elif isinstance(_raw, dict):
+                _n_comp = len(_raw.get("competitors", []))
+        except Exception:
+            _n_comp = 0
+    _priced_mtime = ""
+    _pp = os.path.join(os.getcwd(), "data", "final_priced_latest.csv")
+    if os.path.isfile(_pp):
+        try:
+            _priced_mtime = datetime.fromtimestamp(os.path.getmtime(_pp)).strftime("%Y-%m-%d %H:%M")
+        except Exception:
+            _priced_mtime = "—"
+    _m1, _m2, _m3 = st.columns(3)
+    _m1.metric("منتجات كتالوجنا", f"{_n_our:,}" if _n_our else "—")
+    _m2.metric("منافسون (روابط Sitemap)", f"{_n_comp}" if _n_comp else "—")
+    _m3.metric("آخر تحديث تسعير", _priced_mtime or "—")
     # تحديث تلقائي مباشر من ملفات الخلفية كل 12 ثانية
     try:
         from streamlit_autorefresh import st_autorefresh
@@ -1509,12 +1869,13 @@ if page == "📊 لوحة التحكم":
     if changes:
         st.markdown("#### 🔔 تغييرات أسعار آخر 7 أيام")
         c_df = pd.DataFrame(changes)
-        st.dataframe(c_df[["product_name","competitor","old_price","new_price",
-                            "price_diff","new_date"]].rename(columns={
+        _chg = c_df[["product_name","competitor","old_price","new_price",
+                     "price_diff","new_date"]].rename(columns={
             "product_name": "المنتج", "competitor": "المنافس",
-            "old_price": "السعر السابق", "new_price": "السعر الجديد",
-            "price_diff": "التغيير", "new_date": "التاريخ"
-        }).head(200), width="stretch", height=200)
+            "old_price": "السعر السابق (ر.س)", "new_price": "السعر الجديد (ر.س)",
+            "price_diff": "التغيير (ر.س)", "new_date": "التاريخ"
+        }).head(200)
+        st.dataframe(_chg, width="stretch", height=200, hide_index=True)
         st.markdown("---")
 
     if st.session_state.results:
@@ -1607,6 +1968,9 @@ if page == "📊 لوحة التحكم":
         else:
             st.info("👈 ارفع ملفاتك من قسم 'رفع الملفات'")
 
+    st.markdown("---")
+    render_pricing_detail_panel()
+
 
 # ════════════════════════════════════════════════
 #  1b. كشط المنافسين (Sitemap + CSV حي)
@@ -1647,217 +2011,6 @@ elif page == "🏢 كشط المنافسين":
 
 
 # ════════════════════════════════════════════════
-elif page == "📊 لوحة التسعير":
-    try:
-        st.header("📊 لوحة التسعير")
-        st.caption(
-            f"رؤى تسعير تعتمد خط أساس ثابت: **{MAIN_STORE_NAME} ({MAIN_STORE_DOMAIN})** مقابل المنافسين."
-        )
-        db_log("pricing_dashboard", "view")
-
-        if "final_priced_df" not in st.session_state or st.session_state["final_priced_df"] is None:
-            _auto_priced_path = os.path.join(os.getcwd(), "data", "final_priced_latest.csv")
-            if os.path.exists(_auto_priced_path):
-                try:
-                    st.session_state["final_priced_df"] = pd.read_csv(_auto_priced_path)
-                    st.success("✅ تم تحميل نتائج التسعير التلقائي الجاهزة من الخلفية.")
-                except Exception as _e:
-                    st.warning(f"تعذر تحميل نتائج التسعير التلقائي: {str(_e)}")
-            if st.session_state.get("final_priced_df") is None:
-                st.info("لا توجد نتائج تسعير جاهزة بعد. سيتم عرضها تلقائياً عند اكتمال المعالجة الخلفية.")
-
-        df = st.session_state.get("final_priced_df")
-        if not isinstance(df, pd.DataFrame):
-            st.error("final_priced_df يجب أن يكون DataFrame.")
-            df = None
-        elif df.empty:
-            st.warning("جدول التسعير فارغ.")
-            df = None
-
-        if df is not None:
-            from utils.ui_components import render_product_cards
-
-            work = df.copy()
-            if "sent_to_make_keys" not in st.session_state:
-                st.session_state["sent_to_make_keys"] = set()
-
-            for c in ("price", "comp_price", "suggested_price", "match_score"):
-                if c not in work.columns:
-                    work[c] = 0.0
-                work[c] = pd.to_numeric(work[c], errors="coerce").fillna(0.0)
-
-            if "status" not in work.columns:
-                work["status"] = ""
-            work["status"] = work["status"].fillna("").astype(str)
-
-            group_key_col = "sku" if "sku" in work.columns else "name"
-            work["_group_key"] = work[group_key_col].astype(str).fillna("").str.strip()
-            work.loc[work["_group_key"].isin(["", "N/A", "nan", "None"]), "_group_key"] = (
-                work.get("name", pd.Series(["N/A"] * len(work), index=work.index)).astype(str).str.strip()
-            )
-
-            # min_comp_price per product key (strict funnel baseline against cheapest competitor)
-            work["min_comp_price"] = work.groupby("_group_key", dropna=False)["comp_price"].transform("min")
-            work["min_comp_price"] = pd.to_numeric(work["min_comp_price"], errors="coerce").fillna(0.0)
-
-            # state tracking: move to processed after sync click in card
-            sent_keys = {str(x) for x in st.session_state.get("sent_to_make_keys", set())}
-            row_keys = work.get("sku", work.get("name", pd.Series([""] * len(work), index=work.index))).astype(str)
-            work.loc[row_keys.isin(sent_keys), "status"] = "sent_to_make"
-
-            rel_diff = (
-                (work["price"] - work["min_comp_price"]).abs()
-                / work["min_comp_price"].replace(0, pd.NA)
-            ).fillna(999.0)
-            status_l = work["status"].str.lower()
-            valid_comp = work["min_comp_price"] > 0
-            mask_verified_missing = status_l.eq("missing_after_verification")
-            mask_processed = status_l.eq("sent_to_make")
-            mask_mb_suspect = (
-                work["mb_suspect"].fillna(False).astype(bool)
-                if "mb_suspect" in work.columns
-                else pd.Series(False, index=work.index)
-            )
-            mask_review = (~mask_verified_missing) & (
-                status_l.isin({"processing", "under_review"})
-                | (work["match_score"] < 80)
-                | mask_mb_suspect
-            )
-            mask_higher = (~mask_verified_missing & ~mask_processed & ~mask_review & valid_comp & (work["price"] > work["min_comp_price"]))
-            mask_lower = (~mask_verified_missing & ~mask_processed & ~mask_review & valid_comp & (work["price"] < work["min_comp_price"]))
-            mask_approved = (~mask_verified_missing & ~mask_processed & ~mask_review & valid_comp & (rel_diff <= 0.02))
-
-            # Missing products: in competitors feed but not in Mahwous catalog/SKU
-            missing_df = pd.DataFrame()
-            comp_csv = os.path.join(os.getcwd(), "data", "competitors_latest.csv")
-            if os.path.exists(comp_csv):
-                try:
-                    comp_raw = pd.read_csv(comp_csv)
-                    rename_map = {
-                        "الاسم": "name",
-                        "السعر": "comp_price",
-                        "الماركة": "brand",
-                        "رابط_الصورة": "comp_image_url",
-                        "رابط_المنتج": "comp_url",
-                        "المنافس": "competitor_name",
-                    }
-                    for ar, en in rename_map.items():
-                        if ar in comp_raw.columns and en not in comp_raw.columns:
-                            comp_raw[en] = comp_raw[ar]
-                    if "name" not in comp_raw.columns:
-                        comp_raw["name"] = "N/A"
-                    if "sku" not in comp_raw.columns:
-                        comp_raw["sku"] = ""
-                    if "comp_image_url" not in comp_raw.columns and "image_url" in comp_raw.columns:
-                        comp_raw["comp_image_url"] = comp_raw["image_url"]
-                    if "competitor_name" not in comp_raw.columns:
-                        comp_raw["competitor_name"] = (
-                            comp_raw.get("comp_url", pd.Series([""] * len(comp_raw), index=comp_raw.index))
-                            .astype(str)
-                            .str.extract(r"https?://([^/]+)", expand=False)
-                            .fillna("Competitor")
-                        )
-                    comp_raw["comp_price"] = pd.to_numeric(comp_raw.get("comp_price", 0), errors="coerce").fillna(0.0)
-                    comp_raw["sku"] = comp_raw["sku"].astype(str).fillna("").str.strip()
-                    comp_raw["name"] = comp_raw["name"].astype(str).fillna("").str.strip()
-
-                    mah_skus = set(work.get("sku", pd.Series(dtype=str)).astype(str).str.strip().tolist())
-                    mah_names = set(work.get("name", pd.Series(dtype=str)).astype(str).str.strip().tolist())
-                    miss_mask = (~comp_raw["sku"].isin(mah_skus)) & (~comp_raw["name"].isin(mah_names))
-                    missing_df = comp_raw.loc[miss_mask].copy()
-                    missing_df["price"] = pd.NA
-                    missing_df["suggested_price"] = 0.0
-                    missing_df["is_missing"] = True
-                    missing_df["status"] = "missing"
-                except Exception:
-                    missing_df = pd.DataFrame()
-
-                df_higher = work[mask_higher].copy()
-                df_lower = work[mask_lower].copy()
-                df_approved = work[mask_approved].copy()
-                df_review = work[mask_review].copy()
-                df_processed = work[mask_processed].copy()
-                verified_missing_df = work[mask_verified_missing].copy()
-                if not verified_missing_df.empty:
-                    verified_missing_df["is_missing"] = True
-                    if "comp_name" in verified_missing_df.columns and "competitor_name" not in verified_missing_df.columns:
-                        verified_missing_df["competitor_name"] = verified_missing_df["comp_name"]
-                    if "comp_image_url" in verified_missing_df.columns and "image_url" not in verified_missing_df.columns:
-                        verified_missing_df["image_url"] = verified_missing_df["comp_image_url"]
-                    if missing_df.empty:
-                        missing_df = verified_missing_df
-                    else:
-                        missing_df = pd.concat([missing_df, verified_missing_df], ignore_index=True, sort=False)
-
-                # Approve & Sync Prices to Salla (Make.com) with lock/spinner/state updates
-                sync_df = pd.concat([df_higher, df_lower, df_approved], ignore_index=True, sort=False)
-                if not sync_df.empty and "sku" in sync_df.columns:
-                    sync_df = sync_df.drop_duplicates(subset=["sku"], keep="last")
-                st.markdown("### 🚀 Approve & Sync Prices to Salla")
-                sync_disabled = bool(st.session_state.get("pricing_sync_in_progress", False)) or sync_df.empty
-                if st.button(
-                    f"🚀 اعتماد ومزامنة الأسعار إلى سلة ({len(sync_df)})",
-                    key="btn_approve_sync_salla_make",
-                    type="primary",
-                    disabled=sync_disabled,
-                    width="stretch",
-                ):
-                    st.session_state["pricing_sync_in_progress"] = True
-                    try:
-                        with st.spinner("جاري إرسال البيانات إلى متجر سلة عبر Make.com..."):
-                            ok = send_approved_prices_to_make(sync_df)
-                        if ok:
-                            sent_skus = set(sync_df["sku"].astype(str).tolist()) if "sku" in sync_df.columns else set()
-                            base_df = st.session_state.get("final_priced_df")
-                            if isinstance(base_df, pd.DataFrame) and not base_df.empty and sent_skus:
-                                base_df = base_df.copy()
-                                if "status" not in base_df.columns:
-                                    base_df["status"] = ""
-                                _m = base_df["sku"].astype(str).isin(sent_skus) if "sku" in base_df.columns else pd.Series([False] * len(base_df), index=base_df.index)
-                                base_df.loc[_m, "status"] = "sent_to_make"
-                                st.session_state["final_priced_df"] = base_df
-                                st.session_state["sent_to_make_keys"] = st.session_state.get("sent_to_make_keys", set()) | sent_skus
-                            st.toast("تم تحديث الأسعار بنجاح! 🚀", icon="✅")
-                            st.session_state["pricing_sync_in_progress"] = False
-                            st.rerun()
-                        else:
-                            st.error("فشل إرسال الأسعار إلى Make.com. تحقق من Webhook والاتصال.")
-                    except Exception as _sync_e:
-                        logger.exception("Pricing sync to Make failed")
-                        st.error(f"حدث خطأ أثناء المزامنة: {_sync_e}")
-                    finally:
-                        st.session_state["pricing_sync_in_progress"] = False
-
-                tabs = st.tabs(
-                    [
-                        "🔴 سعر أعلى",
-                        "🟢 سعر أقل",
-                        "✅ موافق عليها",
-                        "🔍 منتجات مفقودة",
-                        "⚠️ تحت المراجعة",
-                        "✔️ تمت المعالجة",
-                    ]
-                )
-                with tabs[0]:
-                    render_product_cards(df_higher, key_prefix="wf_higher")
-                with tabs[1]:
-                    render_product_cards(df_lower, key_prefix="wf_lower")
-                with tabs[2]:
-                    render_product_cards(df_approved, key_prefix="wf_approved")
-                with tabs[3]:
-                    render_product_cards(missing_df, key_prefix="wf_missing")
-                with tabs[4]:
-                    render_product_cards(df_review, key_prefix="wf_review")
-                with tabs[5]:
-                    render_product_cards(df_processed, key_prefix="wf_processed")
-                    st.divider()
-                    render_salla_export_ui(df_processed, missing_df=missing_df)
-    except Exception as e:
-        logger.exception("Critical error in pricing dashboard block: %s", e)
-        st.error(f"حدث خطأ غير متوقع أثناء تشغيل لوحة التسعير: {type(e).__name__}: {str(e)[:200]}")
-
-
-# ════════════════════════════════════════════════
 #  2. رفع الملفات
 # ════════════════════════════════════════════════
 elif page == "📂 رفع الملفات":
@@ -1883,10 +2036,15 @@ elif page == "📂 رفع الملفات":
                 else:
                     # نوحّد الحفظ بصيغة CSV حتى يبقى التحميل التلقائي ثابتاً مهما كان الملف المرفوع.
                     _internal_df.to_csv(INTERNAL_STORE_PATH, index=False, encoding="utf-8-sig")
+                    _gdn, _gdp, _gdi = guess_default_columns(_internal_df)
+                    _mapped = apply_column_mapping(_internal_df, _gdn, _gdp, _gdi)
+                    replace_our_catalog_from_dataframe(_mapped)
                     st.session_state.store_df = _internal_df
                     st.session_state.our_df = _internal_df
                     st.session_state.store_autoloaded = True
-                    st.success("تم تحديث قاعدة بيانات متجر مهووس الداخلية بنجاح! سيتم استخدام هذا الملف تلقائياً من الآن فصاعداً.")
+                    st.success(
+                        "تم تحديث ملف مهووس و**جدول our_catalog** في قاعدة البيانات بالكامل من هذا الملف."
+                    )
             except Exception as _save_e:
                 st.error(f"❌ تعذر تحديث الملف الداخلي: {_save_e}")
 
@@ -2100,11 +2258,17 @@ elif page == "📂 رفع الملفات":
                     )
                     # ── v26: upsert كتالوج يومي بدون تكرار ──────────
                     with st.spinner("📦 تحديث الكتالوج اليومي..."):
-                        r_our  = upsert_our_catalog(our_df,
-                            name_col="اسم المنتج", id_col="رقم المنتج", price_col="السعر")
+                        r_our = replace_our_catalog_from_dataframe(
+                            our_df,
+                            name_col="اسم المنتج",
+                            id_col="رقم المنتج",
+                            price_col="السعر",
+                        )
                         r_comp = upsert_comp_catalog(comp_dfs)
-                        st.caption(f"✅ كتالوجنا: {r_our['inserted']} جديد / {r_our['updated']} تحديث | "
-                                   f"المنافسين: {r_comp['new_products']} جديد")
+                        st.caption(
+                            f"✅ كتالوجنا: أُعيد بناء **our_catalog** ({r_our.get('inserted', 0)} صف) | "
+                            f"المنافسين: {r_comp['new_products']} جديد"
+                        )
                     # ─────────────────────────────────────────────────
                     st.session_state.our_df = our_df
                     st.session_state.comp_dfs = comp_dfs

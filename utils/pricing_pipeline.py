@@ -22,6 +22,49 @@ logger = logging.getLogger(__name__)
 _AUTO_PIPELINE_LOCK = threading.Lock()
 _LAST_AUTO_PIPELINE_AT = 0.0
 
+_SCRAPER_STATE_DB = os.path.join("data", "scraper_state.db")
+
+
+def _ensure_competitors_csv_from_product_state(comp_file: str) -> bool:
+    """
+    إن لم يُصدَّر competitors_latest.csv بعد (خدمة مستمرة)، ابنِه من جدول product_state.
+    """
+    if os.path.isfile(comp_file):
+        return True
+    try:
+        import sqlite3
+
+        if not os.path.isfile(_SCRAPER_STATE_DB):
+            return False
+        conn_fb = sqlite3.connect(_SCRAPER_STATE_DB, timeout=30)
+        try:
+            df_fb = pd.read_sql(
+                """
+                SELECT
+                    name AS الاسم,
+                    price AS السعر,
+                    brand AS الماركة,
+                    image_url AS رابط_الصورة,
+                    comp_url AS رابط_المنتج,
+                    sku
+                FROM product_state
+                """,
+                conn_fb,
+            )
+        finally:
+            conn_fb.close()
+        if df_fb is None or df_fb.empty:
+            return False
+        os.makedirs("data", exist_ok=True)
+        df_fb.to_csv(comp_file, index=False, encoding="utf-8-sig")
+        logger.info(
+            "Built competitors_latest.csv from product_state (%s rows)", len(df_fb)
+        )
+        return True
+    except Exception as e:
+        logger.warning("Fallback product_state → CSV failed: %s", e)
+        return False
+
 
 def _merge_priced_with_previous(
     priced_df: pd.DataFrame,
@@ -134,6 +177,8 @@ def run_full_pricing_pipeline(df_mine: pd.DataFrame) -> pd.DataFrame:
     يقوم بربط بياناتك مع بيانات المنافسين المحدثة، يطابقها بذكاء، ثم يسعرها عبر الـ AI.
     """
     comp_file = "data/competitors_latest.csv"
+    if not os.path.exists(comp_file):
+        _ensure_competitors_csv_from_product_state(comp_file)
     if not os.path.exists(comp_file):
         raise FileNotFoundError(
             "لم يتم العثور على بيانات المنافسين. الرجاء تشغيل الكاشط أولاً."
@@ -373,7 +418,7 @@ def _load_our_catalog_df(db_path: str | None = None) -> pd.DataFrame:
                 COALESCE(product_name, '') AS name,
                 COALESCE(price, 0) AS price,
                 COALESCE(cost_price, 0) AS cost,
-                '' AS image_url
+                COALESCE(image_url, '') AS image_url
             FROM our_catalog
             """,
             conn,
@@ -398,7 +443,7 @@ def run_auto_pricing_pipeline_background(reason: str = "", changed_rows: int = 0
     global _LAST_AUTO_PIPELINE_AT
 
     # Debounce بسيط لتجنب تشغيل متكرر جداً عند الدُفعات السريعة.
-    min_interval_sec = int(os.environ.get("AUTO_PIPELINE_MIN_INTERVAL_SEC", "120"))
+    min_interval_sec = int(os.environ.get("AUTO_PIPELINE_MIN_INTERVAL_SEC", "30"))
     now = time.time()
     if (now - _LAST_AUTO_PIPELINE_AT) < max(5, min_interval_sec):
         return False
@@ -413,7 +458,8 @@ def run_auto_pricing_pipeline_background(reason: str = "", changed_rows: int = 0
 
         comp_file = "data/competitors_latest.csv"
         if not os.path.exists(comp_file):
-            return False
+            if not _ensure_competitors_csv_from_product_state(comp_file):
+                return False
 
         df_mine = _load_our_catalog_df()
         priced_df = run_full_pricing_pipeline(df_mine)

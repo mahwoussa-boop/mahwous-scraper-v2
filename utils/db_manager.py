@@ -14,15 +14,26 @@ _DB_NAME = "pricing_v18.db"
 def _resolve_db_path() -> str:
     """
     مسار ملف SQLite قابل للكتابة على كل المنصات.
-    - Linux / Streamlit Cloud / Railway: غالباً tempfile → /tmp
-    - Windows: مجلد Temp للمستخدم (لا تستخدم /tmp مباشرة — غير موجود أو غير قابل للكتابة)
-    - اختياري: MAHWOUS_DB_DIR=مسار_مجلد لفرض موقع (مثلاً قرص مرفق على السيرفر)
+    - MAHWOUS_DB_DIR: فرض مجلد (الأولوية القصوى)
+    - مجلد المشروع `data/pricing_v18.db` إن وُجد الملف أو المجلد — يوحّد القراءة/الكتابة مع الملفات على القرص
+    - وإلا tempfile.gettempdir() (Streamlit Cloud / إلخ)
     """
     override = os.environ.get("MAHWOUS_DB_DIR", "").strip()
     if override:
         parent = os.path.abspath(override)
         os.makedirs(parent, exist_ok=True)
         return os.path.join(parent, _DB_NAME)
+    project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    local_data = os.path.join(project_root, "data")
+    local_db = os.path.join(local_data, _DB_NAME)
+    if os.path.isfile(local_db):
+        return local_db
+    try:
+        os.makedirs(local_data, exist_ok=True)
+    except Exception:
+        pass
+    if os.path.isdir(local_data):
+        return local_db
     return os.path.join(tempfile.gettempdir(), _DB_NAME)
 
 
@@ -464,13 +475,15 @@ def init_db_v26(conn=None):
         UNIQUE(competitor, norm_name)
     )""")
 
-    # كتالوج متجرنا (يُحدَّث يومياً)
+    # كتالوج متجرنا (يُحدَّث يومياً) — يشمل التكلفة ورابط صورة المنتج للمقارنة البصرية
     cur.execute("""CREATE TABLE IF NOT EXISTS our_catalog (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         product_id TEXT UNIQUE,
         product_name TEXT NOT NULL,
         norm_name TEXT,
         price REAL,
+        cost_price REAL DEFAULT 0,
+        image_url TEXT DEFAULT '',
         first_seen TEXT,
         last_seen TEXT
     )""")
@@ -549,6 +562,109 @@ def upsert_our_catalog(our_df, name_col="اسم المنتج", id_col="رقم ا
     conn.commit()
     conn.close()
     return {"updated": rows_updated, "inserted": rows_inserted}
+
+
+def replace_our_catalog_from_dataframe(
+    our_df,
+    *,
+    name_col: str | None = None,
+    id_col: str | None = None,
+    price_col: str | None = None,
+    cost_col: str | None = None,
+    image_col: str | None = None,
+) -> dict:
+    """
+    يفرّغ جدول our_catalog ويعيد ملءه من DataFrame — للرفع الكامل أو استبدال بيانات الاختبار
+    بـ mahwous_catalog.csv الحقيقي.
+    """
+    import hashlib
+    import re
+
+    import pandas as pd
+
+    if our_df is None or our_df.empty:
+        return {"inserted": 0, "cleared": False}
+
+    df = our_df.copy()
+
+    def _pick(candidates):
+        for c in candidates:
+            if c in df.columns:
+                return c
+        return None
+
+    nc = name_col or _pick(
+        ("اسم المنتج", "أسم المنتج", "name", "product_name", "المنتج", "Product Name")
+    )
+    ic = id_col or _pick(
+        ("رقم المنتج", "رمز المنتج sku", "sku", "SKU", "product_id", "Product ID")
+    )
+    pc = price_col or _pick(("السعر", "سعر المنتج", "price", "Price"))
+    cc = cost_col or _pick(
+        ("التكلفة", "سعر التكلفة", "cost", "cost_price", "تكلفة", "Cost")
+    )
+    img_c = image_col or _pick(
+        ("صورة المنتج", "image", "image_url", "الصورة", "img", "رابط الصورة")
+    )
+
+    if not nc or not pc:
+        logger.error("replace_our_catalog_from_dataframe: missing name or price column")
+        return {"inserted": 0, "cleared": False}
+
+    if ic and ic in df.columns:
+        df = df.drop_duplicates(subset=[ic], keep="last")
+
+    conn = get_db()
+    cur = conn.cursor()
+    try:
+        cur.execute("ALTER TABLE our_catalog ADD COLUMN cost_price REAL DEFAULT 0")
+    except Exception:
+        pass
+    try:
+        cur.execute("ALTER TABLE our_catalog ADD COLUMN image_url TEXT DEFAULT ''")
+    except Exception:
+        pass
+    cur.execute("DELETE FROM our_catalog")
+    conn.commit()
+
+    today = datetime.now().strftime("%Y-%m-%d")
+    inserted = 0
+    for _, row in df.iterrows():
+        name = str(row.get(nc, "")).strip()
+        if not name or name.lower() in ("nan", "none", ""):
+            continue
+        norm = re.sub(r"\s+", " ", name.lower().strip())
+        pid = ""
+        if ic:
+            pid = str(row.get(ic, "")).strip().rstrip(".0")
+        if not pid:
+            pid = "auto-" + hashlib.sha256(norm.encode("utf-8")).hexdigest()[:16]
+        try:
+            price = float(str(row.get(pc, 0)).replace(",", ""))
+        except Exception:
+            price = 0.0
+        cost = 0.0
+        if cc:
+            try:
+                cost = float(str(row.get(cc, 0)).replace(",", ""))
+            except Exception:
+                cost = 0.0
+        img_val = ""
+        if img_c:
+            img_val = str(row.get(img_c, "") or "").strip()
+            if img_val.lower() in ("nan", "none", "null", ""):
+                img_val = ""
+        cur.execute(
+            """INSERT INTO our_catalog (product_id, product_name, norm_name, price, cost_price, image_url, first_seen, last_seen)
+               VALUES (?,?,?,?,?,?,?,?)""",
+            (pid, name, norm, price, cost, img_val, today, today),
+        )
+        inserted += 1
+
+    conn.commit()
+    conn.close()
+    logger.info("replace_our_catalog_from_dataframe: inserted %s rows", inserted)
+    return {"inserted": inserted, "cleared": True}
 
 
 def upsert_comp_catalog(comp_dfs: dict):
@@ -776,6 +892,10 @@ def migrate_db_v26():
             cur.execute("ALTER TABLE our_catalog ADD COLUMN cost_price REAL DEFAULT 0")
         except Exception:
             pass  # العمود موجود مسبقاً
+        try:
+            cur.execute("ALTER TABLE our_catalog ADD COLUMN image_url TEXT DEFAULT ''")
+        except Exception:
+            pass
 
         # إضافة عمود auto_processed لجدول processed_products
         try:

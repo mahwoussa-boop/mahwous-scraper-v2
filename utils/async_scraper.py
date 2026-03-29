@@ -19,6 +19,7 @@ import random
 import re
 import shutil
 import sqlite3
+import threading
 import time
 import xml.etree.ElementTree as ET
 from datetime import datetime, timezone
@@ -49,10 +50,17 @@ COMPETITORS_FILE = os.path.join(DATA_DIR, "competitors_list.json")
 MAX_URL_ATTEMPTS = int(os.environ.get("SCRAPER_MAX_URL_ATTEMPTS", "3"))
 
 _USER_AGENTS: List[str] = [
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/129.0.0.0 Safari/537.36 Edg/129.0.0.0",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.1 Safari/605.1.15",
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36 Edg/121.0.0.0",
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Safari/605.1.15",
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
     "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:133.0) Gecko/20100101 Firefox/133.0",
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:122.0) Gecko/20100101 Firefox/122.0",
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36",
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
@@ -588,7 +596,10 @@ def _export_competitors_csv_prioritized() -> int:
         # لا نكسر دورة الكشط؛ نُبقي الملف الحالي كما هو.
         if os.path.exists(COMPETITOR_CSV):
             try:
-                return int(len(pd.read_csv(COMPETITOR_CSV)))
+                try:
+                    return int(len(pd.read_csv(COMPETITOR_CSV, encoding="utf-8-sig", on_bad_lines="skip")))
+                except TypeError:
+                    return int(len(pd.read_csv(COMPETITOR_CSV, encoding="utf-8-sig")))
             except Exception:
                 return len(out)
         return len(out)
@@ -1274,8 +1285,9 @@ class AsyncCompetitorScraper:
     ) -> ScrapeAttempt:
         max_tries = int(os.environ.get("SCRAPER_FETCH_RETRIES", "4"))
         max_tries = max(1, min(max_tries, 7))
-        min_d = float(os.environ.get("SCRAPER_MIN_DELAY", "0.12"))
-        max_d = float(os.environ.get("SCRAPER_MAX_DELAY", "0.85"))
+        # jitter أوسع افتراضياً يقلل نمط الطلبات الثابت (403/429) — يمكن ضبطه بالبيئة
+        min_d = float(os.environ.get("SCRAPER_MIN_DELAY", "0.22"))
+        max_d = float(os.environ.get("SCRAPER_MAX_DELAY", "1.35"))
         if max_d < min_d:
             min_d, max_d = max_d, min_d
 
@@ -1499,6 +1511,11 @@ async def _process_pending_batch(
             ext_method = str(row_db.pop("extraction_method", "") or att.extraction_method or "")
             if not str(row_db.get("comp_url", "") or "").strip():
                 row_db["comp_url"] = str(url).strip()
+            try:
+                _hn = urlparse(str(row_db.get("comp_url") or url).strip()).netloc.lower()
+                row_db["competitor"] = _hn[4:] if _hn.startswith("www.") else _hn
+            except Exception:
+                row_db["competitor"] = ""
             # ذاكرة حية فورية — قبل SQLite/CSV الدفعي (مع طريقة الاستخراج للتشخيص)
             push_scraped_product(row_db, extraction_method=ext_method)
             try:
@@ -1717,6 +1734,24 @@ async def run_continuous_scraper_service() -> None:
                     _merge_scraper_progress(
                         {"phase": "process", "running": True, **_progress_from_queue()}
                     )
+                    if out.get("updated_rows", 0) > 0:
+                        rows_in_csv = _export_competitors_csv_prioritized()
+                        _merge_scraper_progress({"rows_in_csv": rows_in_csv})
+                        try:
+                            from utils.pricing_pipeline import (
+                                run_auto_pricing_pipeline_background,
+                            )
+
+                            threading.Thread(
+                                target=run_auto_pricing_pipeline_background,
+                                kwargs={
+                                    "reason": "scraper_batch_update",
+                                    "changed_rows": int(out.get("updated_rows", 0) or 0),
+                                },
+                                daemon=True,
+                            ).start()
+                        except Exception:
+                            pass
             except Exception as e:
                 logger.exception("Batch processing failed, will continue: %s", e)
                 _merge_scraper_progress({"last_error": str(e)})
