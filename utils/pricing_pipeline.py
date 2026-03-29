@@ -11,7 +11,11 @@ import time
 import pandas as pd
 
 from engines.ai_engine_enhanced import EnhancedAIPricingEngine
-from utils.gemini_verifier import GeminiMatchVerifier
+from utils.merchant_brain import apply_merchant_brain_post_process
+from utils.gemini_visual_verifier import (
+    VisualMatchVerdict,
+    get_visual_verifier,
+)
 from utils.matcher import SmartMatcher
 
 logger = logging.getLogger(__name__)
@@ -222,41 +226,68 @@ def run_full_pricing_pipeline(df_mine: pd.DataFrame) -> pd.DataFrame:
         0
     )
 
-    # Gemini AI verifier for doubtful matches (50%..79%)
+    # SmartMatcher between(50, 89) → get_visual_verifier() + كاش match_cache_v21.db
     final_df["ai_verification_state"] = "not_checked"
     final_df["ai_verification_confidence"] = 0
     final_df["ai_verification_reason"] = ""
-    verifier = GeminiMatchVerifier()
-    doubtful_mask = final_df["match_score"].between(50, 79, inclusive="both")
+    final_df["visual_verdict_confidence"] = pd.NA
+    final_df["visual_verdict_reasoning"] = ""
+    final_df["visual_from_cache"] = False
+
+    visual_verifier = get_visual_verifier()
+    supreme_mask = final_df["match_score"].between(50, 89, inclusive="both")
     missing_rows = pd.DataFrame()
-    if doubtful_mask.any():
-        idxs = final_df.index[doubtful_mask].tolist()
+    if supreme_mask.any():
+        idxs = final_df.index[supreme_mask].tolist()
         _gemini_log_n = 0
         for idx in idxs:
             row = final_df.loc[idx]
             mah_name = str(row.get("name", "") or "")
             comp_name = str(row.get("comp_name", row.get("name_comp", "")) or "")
+            img_mine = str(row.get("image_url", "") or "").strip()
+            img_comp = str(row.get("comp_image_url", "") or "").strip()
+
             if _gemini_log_n < 12:
                 try:
                     from utils.live_price_store import append_activity_log
 
                     append_activity_log(
-                        f"🤖 Gemini: فحص مطابقة «{mah_name[:70]}» ↔ «{comp_name[:50]}»"
+                        f"🎯 Supreme Visual: «{mah_name[:70]}» ↔ «{comp_name[:50]}»"
                     )
                     _gemini_log_n += 1
                 except Exception:
                     pass
-            vr = verifier.verify_perfume_match(mah_name, comp_name)
-            is_match = bool(vr.get("is_match", False))
-            conf = int(vr.get("confidence", 0) or 0)
-            reason = str(vr.get("reason", "") or "")
-            final_df.at[idx, "ai_verification_confidence"] = conf
-            final_df.at[idx, "ai_verification_reason"] = reason
-            if is_match and conf >= 85:
-                final_df.at[idx, "ai_verification_state"] = "verified_by_ai"
-                if final_df.at[idx, "match_score"] < conf:
-                    final_df.at[idx, "match_score"] = float(conf)
-            elif not is_match:
+
+            verdict: VisualMatchVerdict
+            if visual_verifier.enabled:
+                verdict = visual_verifier.verify_supreme(
+                    mah_name, comp_name, img_mine, img_comp
+                )
+            else:
+                verdict = VisualMatchVerdict(
+                    is_match=False,
+                    confidence=0.0,
+                    reasoning="المحقق البصري غير مفعّل (لا مفتاح Gemini)",
+                    key_difference=None,
+                    method="disabled",
+                    from_cache=False,
+                )
+
+            conf_pct = int(round(max(0.0, min(1.0, verdict.confidence)) * 100))
+            final_df.at[idx, "visual_verdict_confidence"] = float(verdict.confidence)
+            final_df.at[idx, "visual_verdict_reasoning"] = verdict.reasoning
+            final_df.at[idx, "visual_from_cache"] = bool(verdict.from_cache)
+            final_df.at[idx, "ai_verification_confidence"] = conf_pct
+            final_df.at[idx, "ai_verification_reason"] = verdict.reasoning
+
+            if verdict.method == "disabled":
+                final_df.at[idx, "ai_verification_state"] = "under_review"
+            elif verdict.is_match and verdict.confidence >= 0.85:
+                final_df.at[idx, "ai_verification_state"] = "verified_by_visual_gemini"
+                prev_ms = float(final_df.at[idx, "match_score"])
+                if prev_ms < float(conf_pct):
+                    final_df.at[idx, "match_score"] = float(conf_pct)
+            elif not verdict.is_match:
                 final_df.at[idx, "ai_verification_state"] = "missing_candidate"
                 final_df.at[idx, "status"] = "missing_after_verification"
                 final_df.at[idx, "action_required"] = "🔍 منتجات مفقودة"
@@ -273,6 +304,7 @@ def run_full_pricing_pipeline(df_mine: pd.DataFrame) -> pd.DataFrame:
     logger.info("جاري تشغيل محرك التسعير (VSP)...")
     ai_engine = EnhancedAIPricingEngine()
     priced_df = ai_engine.process_pricing_strategy(final_df, target_margin=0.35)
+    priced_df = apply_merchant_brain_post_process(priced_df)
 
     # Keep missing rows visible for procurement workflow, but never priced
     if not missing_rows.empty:
@@ -302,6 +334,11 @@ def run_full_pricing_pipeline(df_mine: pd.DataFrame) -> pd.DataFrame:
         "ai_verification_state",
         "ai_verification_confidence",
         "ai_verification_reason",
+        "visual_verdict_confidence",
+        "visual_verdict_reasoning",
+        "visual_from_cache",
+        "mb_suspect",
+        "mb_suspect_reason",
         "ai_luxury_factor",
         "ai_scarcity_factor",
     ]

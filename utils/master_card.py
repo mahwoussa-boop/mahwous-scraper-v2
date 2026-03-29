@@ -251,13 +251,14 @@ def build_master_card_html(
 def render_master_cards(
     df: pd.DataFrame,
     show_decision_buttons: bool = True,
-    max_cards: int = 50,
+    per_page: int = 20,
 ) -> None:
     """
     عرض البطاقات الموحدة لكل منتج في Streamlit.
 
     يُجمِّع منتجات متعددة بنفس SKU في بطاقة واحدة
     ويعرض المنافس الأرخص في الواجهة الرئيسية.
+    ترقيم الصفحات: st.session_state['mc_page']، 20 منتجاً لكل صفحة (السابق / التالي).
     """
     import streamlit as st
     from utils.user_preferences import render_decision_buttons
@@ -266,15 +267,35 @@ def render_master_cards(
         st.info("لا توجد بيانات للعرض")
         return
 
-    # تجميع حسب SKU
     sku_col = "sku" if "sku" in df.columns else df.columns[0]
-    groups = df.groupby(sku_col, sort=False)
+    groups_list = list(df.groupby(sku_col, sort=False))
+    total = len(groups_list)
+    per_page = max(1, int(per_page))
+    n_pages = max(1, (total + per_page - 1) // per_page)
 
-    shown = 0
-    for sku, group in groups:
-        if shown >= max_cards:
-            st.caption(f"... و{len(groups) - max_cards} منتج آخر")
-            break
+    if "mc_page" not in st.session_state:
+        st.session_state["mc_page"] = 0
+    page = max(0, min(int(st.session_state["mc_page"]), n_pages - 1))
+    st.session_state["mc_page"] = page
+
+    start = page * per_page
+    page_groups = groups_list[start : start + per_page]
+
+    nav_l, nav_c, nav_r = st.columns([1, 3, 1])
+    with nav_l:
+        if st.button("◀ السابق", disabled=page <= 0, key="master_card_prev"):
+            st.session_state["mc_page"] = page - 1
+            st.rerun()
+    with nav_c:
+        st.caption(
+            f"صفحة {page + 1} من {n_pages} — عرض {len(page_groups)} من أصل {total} منتجاً"
+        )
+    with nav_r:
+        if st.button("التالي ▶", disabled=page >= n_pages - 1, key="master_card_next"):
+            st.session_state["mc_page"] = page + 1
+            st.rerun()
+
+    for idx, (sku, group) in enumerate(page_groups):
 
         # اختر المنافس الأرخص
         if "comp_price" in group.columns:
@@ -337,8 +358,6 @@ def render_master_cards(
                 strategy=strategy,
                 competitor=comp_name,
                 match_score=float(primary.get("match_score", 0) or 0),
-                key_prefix=f"mc_{shown}",
+                key_prefix=f"mc_{start + idx}",
             )
             st.divider()
-
-        shown += 1

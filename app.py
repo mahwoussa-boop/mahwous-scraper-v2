@@ -62,33 +62,19 @@ from utils.db_manager import check_strict_duplicate
 from utils.helpers import (apply_filters, get_filter_options, export_to_excel,
                             export_multiple_sheets, parse_pasted_text,
                             safe_float, format_price, format_diff, make_columns_unique)
-try:
-    from utils.make_helper import (send_price_updates, send_new_products,
-                                    send_missing_products, send_single_product,
-                                    verify_webhook_connection, export_to_make_format,
-                                    send_batch_smart, build_pricing_sync_payload,
-                                    bulk_sync_pricing_recommendations,
-                                    is_pricing_webhook_configured,
-                                    send_approved_prices_to_make)
-except Exception:
-    # Fallback for environments running older cached make_helper versions.
-    from utils import make_helper as _mkh
-
-    send_price_updates = _mkh.send_price_updates
-    send_new_products = _mkh.send_new_products
-    send_missing_products = _mkh.send_missing_products
-    send_single_product = _mkh.send_single_product
-    verify_webhook_connection = _mkh.verify_webhook_connection
-    export_to_make_format = _mkh.export_to_make_format
-    send_batch_smart = _mkh.send_batch_smart
-    build_pricing_sync_payload = _mkh.build_pricing_sync_payload
-    bulk_sync_pricing_recommendations = _mkh.bulk_sync_pricing_recommendations
-    is_pricing_webhook_configured = _mkh.is_pricing_webhook_configured
-    send_approved_prices_to_make = getattr(_mkh, "send_approved_prices_to_make", None)
-
-    if send_approved_prices_to_make is None:
-        def send_approved_prices_to_make(df):
-            return False
+from utils.make_helper import (
+    send_price_updates,
+    send_new_products,
+    send_missing_products,
+    send_single_product,
+    verify_webhook_connection,
+    export_to_make_format,
+    send_batch_smart,
+    build_pricing_sync_payload,
+    bulk_sync_pricing_recommendations,
+    is_pricing_webhook_configured,
+    send_approved_prices_to_make,
+)
 from utils.competitor_manager import render_competitor_scrape_page
 from utils.live_pricing_dashboard import (
     LIVE_RESULT_PAGES,
@@ -96,6 +82,7 @@ from utils.live_pricing_dashboard import (
     run_live_section,
 )
 from utils.pricing_pipeline import load_competitors_latest_for_engine
+from utils.salla_exporter import render_salla_export_ui
 from utils.db_manager import (init_db, log_event, log_decision,
                                log_analysis, get_events, get_decisions,
                                get_analysis_history, upsert_price_history,
@@ -1378,6 +1365,11 @@ with st.sidebar:
                 f'🟡 ثقة متوسطة: <b>{_yc}</b> &nbsp; '
                 f'🔴 مشكوك: <b>{_rc}</b></div>',
                 unsafe_allow_html=True)
+            if _yc >= len(_miss_df) and len(_miss_df) >= 5 and _gc == 0:
+                st.caption(
+                    "💡 **لماذا كلها 🟡؟** صفوف «مفقود» من كشط المنافس غالباً **بلا درجة تطابق** (أو صفر) — "
+                    "الواجهة تعرض «متوسط» **افتراضياً** وليس تقييماً من نموذج قوي. بعد **تحليل كامل** مع مطابقة أسماء/SKU تظهر 🟢/🔴 أوضح."
+                )
         _priced = sum(len(r.get(k, pd.DataFrame())) for k in ("price_raise", "price_lower", "approved", "review"))
         if _priced == 0 and not _miss_df.empty:
             st.info(
@@ -1385,6 +1377,11 @@ with st.sidebar:
                 "أقسام سعر أعلى/أقل/موافق = مقارنة **منتجاتنا** مع المنافس؛ إذا كانت كلها **0** فغالباً "
                 "لا تطابق كافٍ (أسماء مختلفة، ترميز CSV، أو أعمدة غير معروفة). "
                 "جرّب: حفظ CSV بـ **UTF-8**، وتأكد أن **حد الصفوف = 0** لمعالجة الملف كاملاً، ورفع ملفات متطابقة الأعمدة."
+            )
+        elif _priced > 0 and len(_miss_df) > _priced * 5:
+            st.caption(
+                "📌 **لماذا «مفقود» كثير؟** طبيعي عند كشط **آلاف** صفوف المنافس: كل ما **ليس** لديه زوج واضح في كتالوج مهووس "
+                "يُصنَّف مفقود — **لا يعني توقف الكشط**. الأقسام الأخرى تعرض فقط **مطابَكات ناجحة** لحساب السعر."
             )
 
     # قرارات معلقة
@@ -1550,6 +1547,10 @@ if page == "📊 لوحة التحكم":
                 f'<span style="color:#FFD600">🟡 ثقة متوسطة: <b>{_y}</b></span>'
                 f'<span style="color:#FF1744">🔴 مشكوك: <b>{_rd}</b></span>'
                 f'</div>', unsafe_allow_html=True)
+            if _y >= len(_miss_dash) and len(_miss_dash) >= 5 and _g == 0:
+                st.caption(
+                    "💡 إذا **كل المفقود 🟡**: غالباً **لا درجة تطابق** في البيانات — اللون «متوسط» **افتراضي** وليس تأكيد جودة."
+                )
 
         st.markdown("---")
         cc1, cc2 = st.columns(2)
@@ -1712,7 +1713,16 @@ elif page == "📊 لوحة التسعير":
             valid_comp = work["min_comp_price"] > 0
             mask_verified_missing = status_l.eq("missing_after_verification")
             mask_processed = status_l.eq("sent_to_make")
-            mask_review = (~mask_verified_missing) & (status_l.isin({"processing", "under_review"}) | (work["match_score"] < 80))
+            mask_mb_suspect = (
+                work["mb_suspect"].fillna(False).astype(bool)
+                if "mb_suspect" in work.columns
+                else pd.Series(False, index=work.index)
+            )
+            mask_review = (~mask_verified_missing) & (
+                status_l.isin({"processing", "under_review"})
+                | (work["match_score"] < 80)
+                | mask_mb_suspect
+            )
             mask_higher = (~mask_verified_missing & ~mask_processed & ~mask_review & valid_comp & (work["price"] > work["min_comp_price"]))
             mask_lower = (~mask_verified_missing & ~mask_processed & ~mask_review & valid_comp & (work["price"] < work["min_comp_price"]))
             mask_approved = (~mask_verified_missing & ~mask_processed & ~mask_review & valid_comp & (rel_diff <= 0.02))
@@ -1840,6 +1850,8 @@ elif page == "📊 لوحة التسعير":
                     render_product_cards(df_review, key_prefix="wf_review")
                 with tabs[5]:
                     render_product_cards(df_processed, key_prefix="wf_processed")
+                    st.divider()
+                    render_salla_export_ui(df_processed, missing_df=missing_df)
     except Exception as e:
         logger.exception("Critical error in pricing dashboard block: %s", e)
         st.error(f"حدث خطأ غير متوقع أثناء تشغيل لوحة التسعير: {type(e).__name__}: {str(e)[:200]}")
@@ -3074,7 +3086,7 @@ elif page == "🤖 الذكاء الصناعي":
         # إدخال
         _mc1, _mc2 = st.columns([5, 1])
         with _mc1:
-            _user_in = st.text_input("", key="gem_in",
+            _user_in = st.text_input("رسالة Gemini", key="gem_in",
                 placeholder="اسأل Gemini — عن المنتجات، الأسعار، التوصيات...",
                 label_visibility="collapsed")
         with _mc2:

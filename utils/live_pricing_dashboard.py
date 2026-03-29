@@ -219,6 +219,11 @@ def _live_bucket_body(bucket: str, page_label: str) -> None:
     )
     sqlite_rows = get_cards_for_bucket(bucket, limit=cap)
     rows = merge_cards_for_bucket(bucket, sqlite_rows, cap)
+    if n > cap:
+        st.caption(
+            f"⚠️ **{n}** صف في هذا القسم على القرص — يُعرض **{cap}** بطاقة كحد أقصى. "
+            "زِد «حد بطاقات العرض» في الشريط الجانبي (حتى 200) أو صدِّر من لوحة التحكم — **هذا ليس توقفاً للكشط**."
+        )
     st.markdown(_cards_html(rows), unsafe_allow_html=True)
     st.markdown("---")
     _rolling_log_compact()

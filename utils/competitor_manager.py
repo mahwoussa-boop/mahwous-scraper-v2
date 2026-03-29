@@ -936,7 +936,7 @@ def render_competitor_scrape_page():  # noqa: C901
     st.markdown("### 📥 تنزيل الملف الكامل (`competitors_latest.csv`)")
     if os.path.isfile(data_path):
         try:
-            df_comp = pd.read_csv(data_path, encoding="utf-8-sig", errors="replace")
+            df_comp = pd.read_csv(data_path, encoding="utf-8-sig", encoding_errors="replace")
             st.caption(f"الملف الحالي: **{len(df_comp):,}** صفاً — التنزيل يقرأ النسخة الكاملة.")
             st.download_button(
                 "📥 تنزيل CSV",

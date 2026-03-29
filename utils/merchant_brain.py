@@ -15,6 +15,7 @@ import math
 from dataclasses import dataclass, field
 from typing import Literal, Optional
 
+import numpy as np
 import pandas as pd
 
 logger = logging.getLogger(__name__)
@@ -330,3 +331,149 @@ class MerchantBrain:
             sections["optimal"] = df[~high_mask & ~low_mask].copy()
 
         return sections
+
+
+# ── تكامل خط أنابيب التسعير (pricing_pipeline + لوحة التسعير) ─────────────
+MAX_REFERENCE_DROP_PCT: float = 20.0
+
+
+def apply_psychological_pricing(
+    df: pd.DataFrame,
+    price_col: str = "suggested_price",
+    *,
+    enabled: bool = True,
+) -> pd.DataFrame:
+    """
+    يطبّق نهايات نفسية (.99 / .95 / .49) على عمود السعر المقترح بعد المحرك الآلي.
+    """
+    if not enabled or df is None or df.empty or price_col not in df.columns:
+        return df
+    out = df.copy()
+
+    def _one(v) -> float:
+        try:
+            x = float(v)
+        except (TypeError, ValueError):
+            return float("nan")
+        if x <= 0 or np.isnan(x):
+            return x
+        return float(_round_to_psych(x))
+
+    raw = pd.to_numeric(out[price_col], errors="coerce")
+    new_vals = []
+    for v in raw:
+        if pd.isna(v) or v <= 0:
+            new_vals.append(v)
+        else:
+            new_vals.append(_one(v))
+    out[price_col] = new_vals
+    return out
+
+
+def enforce_reference_price_drop_guard(
+    df: pd.DataFrame,
+    reference_col: str = "price",
+    suggested_col: str = "suggested_price",
+    max_drop_pct: float = MAX_REFERENCE_DROP_PCT,
+) -> pd.DataFrame:
+    """
+    لا يُسمح بأن يقل السعر المقترح عن (100 - max_drop_pct)% من السعر المرجعي لمتجر مهووس.
+    عند التجاوز: وسم مشتبه + سبب ثابت، وضبط السعر المقترح عند الحد الأدنى المسموح.
+    """
+    if df is None or df.empty:
+        return df
+    out = df.copy()
+    if suggested_col not in out.columns:
+        return out
+    if "mb_suspect" not in out.columns:
+        out["mb_suspect"] = False
+    if "mb_suspect_reason" not in out.columns:
+        out["mb_suspect_reason"] = ""
+
+    ref = pd.to_numeric(out.get(reference_col, 0), errors="coerce").fillna(0.0)
+    sug = pd.to_numeric(out[suggested_col], errors="coerce")
+
+    floor_ratio = 1.0 - (float(max_drop_pct) / 100.0)
+    for i in out.index:
+        r = float(ref.loc[i]) if i in ref.index else 0.0
+        s = float(sug.loc[i]) if pd.notna(sug.loc[i]) else 0.0
+        if r <= 0 or s <= 0:
+            continue
+        min_allowed = r * floor_ratio
+        if s < min_allowed - 1e-6:
+            out.at[i, "mb_suspect"] = True
+            out.at[i, "mb_suspect_reason"] = "تجاوز حد الخسارة 20%"
+            out.at[i, suggested_col] = round(min_allowed, 2)
+            if "status" in out.columns:
+                st_cur = str(out.at[i, "status"] or "").strip().lower()
+                if st_cur not in ("missing_after_verification", "sent_to_make", "missing"):
+                    out.at[i, "status"] = "under_review"
+            if "action_required" in out.columns:
+                out.at[i, "action_required"] = "⚠️ مشتبه — تجاوز حد الخسارة 20%"
+    return out
+
+
+def sync_pricing_dashboard_labels(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    يضبط status / action_required بما يتوافق مع تبويبات لوحة التسعير عند غياب تعارض مع حالات المطابقة.
+    """
+    if df is None or df.empty:
+        return df
+    out = df.copy()
+    if "status" not in out.columns:
+        out["status"] = ""
+    if "action_required" not in out.columns:
+        out["action_required"] = ""
+    out["status"] = out["status"].fillna("").astype(str)
+    out["action_required"] = out["action_required"].fillna("").astype(str)
+
+    price = pd.to_numeric(out.get("price", 0), errors="coerce").fillna(0.0)
+    comp = pd.to_numeric(out.get("comp_price", 0), errors="coerce").fillna(0.0)
+    ms = pd.to_numeric(out.get("match_score", 100), errors="coerce").fillna(100.0)
+
+    for i in out.index:
+        st = str(out.at[i, "status"] or "").strip().lower()
+        if st in ("missing_after_verification", "sent_to_make", "missing"):
+            continue
+        if "ai_verification_state" in out.columns:
+            avs = str(out.at[i, "ai_verification_state"] or "").strip().lower()
+            if avs and avs != "not_checked":
+                continue
+        sus = False
+        if "mb_suspect" in out.columns:
+            try:
+                sus = bool(out.at[i, "mb_suspect"])
+            except Exception:
+                sus = False
+        if sus:
+            continue
+        c = float(comp.loc[i])
+        p = float(price.loc[i])
+        if c <= 0:
+            if st in ("", "not_checked"):
+                out.at[i, "status"] = "under_review"
+                out.at[i, "action_required"] = "مراجعة — سعر المنافس غير متوفر"
+            continue
+        rel = abs(p - c) / c if c > 0 else 999.0
+        if float(ms.loc[i]) < 80:
+            out.at[i, "status"] = "under_review"
+            out.at[i, "action_required"] = "⚠️ تحت المراجعة — ثقة مطابقة منخفضة"
+        elif rel <= 0.02:
+            out.at[i, "status"] = "aligned"
+            out.at[i, "action_required"] = "✅ موافق — ضمن النطاق"
+        elif p > c:
+            out.at[i, "status"] = "price_above_comp"
+            out.at[i, "action_required"] = "🔴 سعر أعلى من المنافس"
+        else:
+            out.at[i, "status"] = "price_below_comp"
+            out.at[i, "action_required"] = "🟢 سعر أقل من المنافس"
+
+    return out
+
+
+def apply_merchant_brain_post_process(df: pd.DataFrame) -> pd.DataFrame:
+    """تسلسل واحد لخط الأنابيب: نفسي → حماية 20% → تسميات اللوحة."""
+    out = apply_psychological_pricing(df, "suggested_price", enabled=True)
+    out = enforce_reference_price_drop_guard(out)
+    out = sync_pricing_dashboard_labels(out)
+    return out

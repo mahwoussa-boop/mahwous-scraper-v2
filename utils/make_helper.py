@@ -148,11 +148,12 @@ def send_approved_prices_to_make(df: pd.DataFrame) -> bool:
     except requests.exceptions.Timeout:
         logger.exception("send_approved_prices_to_make timeout")
         return False
-    except requests.exceptions.HTTPError:
+    except requests.exceptions.HTTPError as e:
+        r = getattr(e, "response", None)
         logger.exception(
             "send_approved_prices_to_make http_error status=%s body=%s",
-            getattr(resp, "status_code", 0),
-            getattr(resp, "text", "")[:300],
+            getattr(r, "status_code", 0) if r is not None else 0,
+            (getattr(r, "text", "") or "")[:300] if r is not None else "",
         )
         return False
     except Exception:

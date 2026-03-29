@@ -141,7 +141,19 @@ def comp_strip(all_comps):
 
 def miss_card(name, price, brand, size, ptype, comp, suggested_price, note, variant_html, tester_badge, border_color, confidence_level, confidence_score, product_id):
     _cl = str(confidence_level or "").lower()
-    _conf_ar = {"green": "ثقة قوية", "yellow": "ثقة متوسطة", "red": "مشكوك"}.get(_cl, str(confidence_level or "—"))
+    try:
+        _csf = float(confidence_score)
+    except (TypeError, ValueError):
+        _csf = 0.0
+    # لا تعرض «ثقة قوية» مع 0% — يحدث عند صفوف مُستوردة من CSV بلا أعمدة تحليل عربية
+    if _csf <= 0.0:
+        _conf_ar = "غير مُقيَّم (لا درجة مطابقة بعد)"
+        _pct_txt = "—"
+    else:
+        _conf_ar = {"green": "ثقة قوية", "yellow": "ثقة متوسطة", "red": "مشكوك"}.get(
+            _cl, str(confidence_level or "—")
+        )
+        _pct_txt = f"{_csf:.1f}%"
     return f"""
     <div class="miss-card" style="border-left-color: {border_color}">
         <div style="display: flex; justify-content: space-between;">
@@ -155,7 +167,7 @@ def miss_card(name, price, brand, size, ptype, comp, suggested_price, note, vari
             </div>
         </div>
         <div style="margin-top: 8px; font-size: 0.85rem; color: #8b949e;">
-            المنافس: {comp} | درجة ثقة المطابقة: {_conf_ar} ({confidence_score}%)
+            المنافس: {comp} | درجة ثقة المطابقة: {_conf_ar} ({_pct_txt})
         </div>
         {variant_html}
         {f'<div style="margin-top: 5px; color: #ffd600; font-style: italic;">{note}</div>' if note else ''}

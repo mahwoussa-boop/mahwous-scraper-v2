@@ -35,6 +35,13 @@ coverage.xml
 # أرشيفات عرضية — لا تُرفع
 *.zip
 
+# ملفات ترقيع مؤقتة — تُحذف بعد التطبيق
+PATCH_*.py
+apply_fixes.py
+*.patch
+*.bak
+*.tmp
+
 # حزم بناء
 dist/
 build/

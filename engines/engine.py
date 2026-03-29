@@ -24,7 +24,7 @@ try:
                         MATCH_THRESHOLD, HIGH_CONFIDENCE, REVIEW_THRESHOLD,
                         PRICE_TOLERANCE, TESTER_KEYWORDS, SET_KEYWORDS,
                         GEMINI_API_KEYS, OPENROUTER_API_KEY)
-except:
+except Exception:
     REJECT_KEYWORDS = ["sample","عينة","عينه","decant","تقسيم","split","miniature"]
     KNOWN_BRANDS = [
         "Dior","Chanel","Gucci","Tom Ford","Versace","Armani","YSL","Prada","Burberry",
@@ -67,13 +67,13 @@ except:
         "جيمي تشو","لاليك","بوليس","فيكتور رولف",
         "كلوي","بالنسياغا","ميو ميو",
     ]
+    GEMINI_API_KEYS = []
 WORD_REPLACEMENTS = {}
 MATCH_THRESHOLD = 85; HIGH_CONFIDENCE = 95; REVIEW_THRESHOLD = 75
 PRICE_TOLERANCE = 5; TESTER_KEYWORDS = ["tester","تستر"]; SET_KEYWORDS = ["set","طقم","مجموعة"]
 OPENROUTER_API_KEY = ""
 
-# Gemini keys are loaded from config.py to ensure consistency and rotation support.
-# GEMINI_API_KEYS is already imported from config.py above.
+# GEMINI_API_KEYS من config.py عند نجاح الاستيراد؛ لا تُعرّف _load_gemini_keys محلياً ولا تُعاد تعيين القائمة هنا.
 
 # ─── مرادفات ذكية للعطور ────────────────────
 _SYN = {
