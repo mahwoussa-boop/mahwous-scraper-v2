@@ -22,6 +22,7 @@ import time
 import uuid
 import logging
 from datetime import datetime
+from urllib.parse import urlparse
 
 try:
     from streamlit.runtime.scriptrunner import add_script_run_ctx
@@ -177,8 +178,26 @@ def _autoload_internal_store_catalog(show_message: bool = False) -> None:
                 st.session_state.store_autoloaded = True
                 if show_message:
                     st.success("✅ تم تحميل ملف متجر مهووس الأساسي تلقائياً من النظام.")
+                return
         except Exception as _e:
             st.warning(f"تعذر تحميل ملف متجر مهووس الداخلي: {_e}")
+    try:
+        from utils.pricing_pipeline import _load_our_catalog_df
+
+        _odb = _load_our_catalog_df()
+        if isinstance(_odb, pd.DataFrame) and not _odb.empty:
+            st.session_state.store_df = _odb
+            st.session_state.our_df = _odb
+            st.session_state.store_autoloaded = True
+            if show_message:
+                st.success(
+                    "✅ تم تحميل **كتالوج مهووس** من قاعدة SQLite (`our_catalog`) — جاهز للتحليل مع كشط الويب."
+                )
+    except Exception:
+        pass
+
+
+_autoload_internal_store_catalog(show_message=False)
 
 # ════════════════════════════════════════════════
 #  دوال المعالجة — يجب تعريفها قبل استخدامها
@@ -312,6 +331,103 @@ def _restore_results_from_json(results_list):
     return restored
 
 
+def _normalize_missing_df_for_ui(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    يوحّد أعمدة قسم المفقودات لعرض miss_card:
+    دمج final_priced + competitors_latest يترك أحياناً أعمدة إنجليزية فقط
+    (name, comp_price, comp_url) دون منتج_المنافس / سعر_المنافس / المنافس.
+    """
+    if df is None or df.empty:
+        return df
+    o = df.copy()
+    n = len(o)
+    idx = o.index
+
+    def _coalesce_str(candidates):
+        acc = pd.Series([""] * n, index=idx, dtype=object)
+        for c in candidates:
+            if c not in o.columns:
+                continue
+            s = o[c].astype(str).replace(
+                {"nan": "", "None": "", "<NA>": "", "NaT": ""}, regex=False
+            )
+            need = acc.eq("") | acc.isna()
+            acc = acc.where(~need, s.where(s.str.strip().ne(""), acc))
+        return acc.fillna("").astype(str)
+
+    # comp_name / الاسم قبل name لأن name في final_priced غالباً منتج مهووس وليس المنافس
+    o["منتج_المنافس"] = _coalesce_str(
+        ["منتج_المنافس", "comp_name", "الاسم", "name"]
+    )
+
+    price_out = pd.Series(0.0, index=idx, dtype=float)
+    for c in ("سعر_المنافس", "comp_price", "السعر", "price"):
+        if c not in o.columns:
+            continue
+        v = pd.to_numeric(o[c], errors="coerce").fillna(0.0)
+        take = (price_out <= 0) & (v > 0)
+        price_out.loc[take] = v.loc[take]
+    still_zero = price_out <= 0
+    for c in ("سعر_المنافس", "comp_price", "السعر", "price"):
+        if c not in o.columns:
+            continue
+        v = pd.to_numeric(o[c], errors="coerce").fillna(0.0)
+        price_out = price_out.where(~still_zero, v)
+        still_zero = price_out <= 0
+    o["سعر_المنافس"] = price_out
+
+    o["الماركة"] = _coalesce_str(["الماركة", "comp_brand", "brand"])
+
+    comp_out = _coalesce_str(["المنافس", "competitor_name"])
+    url_col = None
+    for uc in ("comp_url", "رابط_المنتج"):
+        if uc in o.columns:
+            url_col = uc
+            break
+    if url_col is not None:
+
+        def _host(u):
+            u = str(u or "").strip()
+            if not u.startswith("http"):
+                return ""
+            try:
+                return urlparse(u).netloc.replace("www.", "")
+            except Exception:
+                return ""
+
+        hosts = o[url_col].map(_host)
+        empty_c = comp_out.str.strip().eq("")
+        comp_out = comp_out.where(~empty_c, hosts)
+    o["المنافس"] = comp_out.fillna("").astype(str)
+
+    sc = pd.Series(0.0, index=idx, dtype=float)
+    if "درجة_التشابه" in o.columns:
+        sc = pd.to_numeric(o["درجة_التشابه"], errors="coerce").fillna(0.0)
+    if "match_score" in o.columns:
+        ms = pd.to_numeric(o["match_score"], errors="coerce").fillna(0.0)
+        sc = sc.where(sc > 0, ms)
+    o["درجة_التشابه"] = sc
+
+    def _fix_conf_row(r) -> str:
+        lvl = str(r.get("مستوى_الثقة", "") or "").strip().lower()
+        try:
+            scc = float(r.get("درجة_التشابه", 0) or 0)
+        except (TypeError, ValueError):
+            scc = 0.0
+        if scc <= 0:
+            return "yellow" if lvl in ("", "green") else lvl
+        if not lvl:
+            if scc >= 68:
+                return "green"
+            if scc >= 55:
+                return "yellow"
+            return "red"
+        return lvl or "yellow"
+
+    o["مستوى_الثقة"] = o.apply(_fix_conf_row, axis=1)
+    return o
+
+
 def _auto_refresh_results_from_background_files() -> bool:
     """
     يوزّع المنتجات تلقائياً من ملفات الخلفية الجاهزة (بدون رفع يدوي):
@@ -344,12 +460,13 @@ def _auto_refresh_results_from_background_files() -> bool:
                     comp_raw["sku"] = ""
                 comp_raw["is_missing"] = True
                 comp_raw["status"] = "missing"
+                _miss_norm = _normalize_missing_df_for_ui(comp_raw)
                 st.session_state.results = {
                     "price_raise": pd.DataFrame(),
                     "price_lower": pd.DataFrame(),
                     "approved": pd.DataFrame(),
                     "review": pd.DataFrame(),
-                    "missing": comp_raw,
+                    "missing": _miss_norm,
                     "all": comp_raw,
                 }
                 st.session_state.analysis_df = comp_raw.copy()
@@ -410,6 +527,8 @@ def _auto_refresh_results_from_background_files() -> bool:
             if not more_missing.empty:
                 more_missing["is_missing"] = True
                 missing_df = pd.concat([missing_df, more_missing], ignore_index=True, sort=False)
+
+        missing_df = _normalize_missing_df_for_ui(missing_df)
 
         auto_results = {
             "price_raise": work[mask_higher].copy(),
@@ -1242,7 +1361,7 @@ with st.sidebar:
             cnt = len(r.get(key, pd.DataFrame()))
             st.caption(f"{icon} {label}: **{cnt}**")
         if len(r.get("missing", pd.DataFrame())) > 0:
-            if st.button("🗑️ مسح المفقودات من الملخص (للتجربة)", key="btn_clear_missing_sidebar", use_container_width=True):
+            if st.button("🗑️ مسح المفقودات من الملخص (للتجربة)", key="btn_clear_missing_sidebar", width="stretch"):
                 st.session_state.results["missing"] = pd.DataFrame()
                 clear_missing_from_last_job()
                 st.rerun()
@@ -1358,7 +1477,7 @@ def render_smart_decision_table(df: pd.DataFrame) -> None:
     st.markdown("### 📋 جدول القرار الذكي")
     st.dataframe(
         show_df.style.apply(_row_style, axis=1),
-        use_container_width=True,
+        width="stretch",
         hide_index=True,
     )
 
@@ -1398,7 +1517,7 @@ if page == "📊 لوحة التحكم":
             "product_name": "المنتج", "competitor": "المنافس",
             "old_price": "السعر السابق", "new_price": "السعر الجديد",
             "price_diff": "التغيير", "new_date": "التاريخ"
-        }).head(200), use_container_width=True, height=200)
+        }).head(200), width="stretch", height=200)
         st.markdown("---")
 
     if st.session_state.results:
@@ -1518,11 +1637,11 @@ elif page == "🏢 كشط المنافسين":
                 # إزالة التكرار مع الحفاظ على ترتيب العرض
                 # Make columns unique before displaying to avoid ValueError
                 display_df = make_columns_unique(our_df[_show_cols].copy())
-                st.dataframe(display_df, use_container_width=True)
+                st.dataframe(display_df, width="stretch")
             else:
                 # Make columns unique before displaying to avoid ValueError
                 display_df = make_columns_unique(our_df.copy())
-                st.dataframe(display_df, use_container_width=True)
+                st.dataframe(display_df, width="stretch")
     render_competitor_scrape_page()
 
 
@@ -1671,7 +1790,7 @@ elif page == "📊 لوحة التسعير":
                     key="btn_approve_sync_salla_make",
                     type="primary",
                     disabled=sync_disabled,
-                    use_container_width=True,
+                    width="stretch",
                 ):
                     st.session_state["pricing_sync_in_progress"] = True
                     try:
@@ -1767,20 +1886,29 @@ elif page == "📂 رفع الملفات":
 
     _scrape_csv_path = os.path.join(os.getcwd(), "data", "competitors_latest.csv")
     _scrape_available = os.path.isfile(_scrape_csv_path)
-    use_web_scrape = st.checkbox(
+    if "analysis_use_web_scrape" not in st.session_state:
+        st.session_state["analysis_use_web_scrape"] = bool(_scrape_available)
+    want_web_scrape_csv = st.checkbox(
         "استخدم تلقائياً نتيجة كشط الويب (`data/competitors_latest.csv`) كمصدر للمنافسين",
-        value=False,
         key="analysis_use_web_scrape",
-        disabled=not _scrape_available,
-        help="يُقرأ الملف من القرص مباشرة. أثناء كتابة الكاشط قد تفشل القراءة مؤقتاً — أعد المحاولة بعد ثوانٍ.",
+        disabled=False,
+        help="يُفعَّل تلقائياً عند أول تشغيل إذا وُجد الملف. على Streamlit Cloud قد يختفي الملف بين إعادة التشغيل — يمكنك تفعيل الخيار مسبقاً.",
     )
-    if use_web_scrape and _scrape_available:
+    use_web_scrape = bool(want_web_scrape_csv) and _scrape_available
+    if use_web_scrape:
         st.info(
             "سيجري **نفس مسار التحليل** (مطابقة + Gemini + توزيع الأقسام): منتجاتكم مقابل بيانات الكشط. "
             "يمكنك الجمع مع ملفات منافس مرفوعة أعلاه."
         )
+    elif want_web_scrape_csv and not _scrape_available:
+        st.caption(
+            "⏳ الخيار مفعّل لكن **`competitors_latest.csv` غير موجود** على هذا الخادم بعد — شغّل «كشط المنافسين» أو انتظر اكتمال أول تصدير؛ "
+            "عند ظهور الملف سيُستخدم تلقائياً دون إعادة الضغط."
+        )
     elif not _scrape_available:
-        st.caption("لتفعيل الخيار: شغّل «كشط المنافسين» حتى يُنشأ الملف.")
+        st.caption("لاستخدام الكشط كمصدر: شغّل «كشط المنافسين» حتى يُنشأ الملف، أو فعّل المربع أعلاه مسبقاً.")
+    else:
+        st.caption("يمكنك تفعيل المربع أعلاه لاستخدام `competitors_latest.csv` دون رفع ملف منافس.")
 
     col_opt1, col_opt2 = st.columns(2)
     with col_opt1:
@@ -1908,7 +2036,7 @@ elif page == "📂 رفع الملفات":
                     )
 
     if st.button("🚀 بدء التحليل", type="primary"):
-        _have_competitor_source = bool(comp_files) or (use_web_scrape and _scrape_available)
+        _have_competitor_source = bool(comp_files) or use_web_scrape
         if (our_file or has_internal_store) and _have_competitor_source:
             if our_file:
                 our_df, err = read_file(our_file)
@@ -2016,10 +2144,15 @@ elif page == "📂 رفع الملفات":
                         prog.progress(1.0, "✅ اكتمل!")
                         st.balloons()
                         st.rerun()
+        elif (our_file or has_internal_store) and want_web_scrape_csv and not _scrape_available:
+            st.warning(
+                "⚠️ خيار **كشط الويب** مفعّل لكن ملف **`data/competitors_latest.csv` غير موجود** على الخادم. "
+                "شغّل الكشط حتى يُنشأ الملف، أو ارفع ملف منافس."
+            )
         else:
             st.warning(
-                "⚠️ يلزم **مصدر منافسين**: إما رفع ملف منافس، أو تفعيل **استخدم نتيجة كشط الويب** عندما يكون "
-                "`competitors_latest.csv` موجوداً — ومع **كتالوج مهووس** (رفع أو تحميل تلقائي)."
+                "⚠️ يلزم **مصدر منافسين**: رفع ملف منافس، أو وجود `data/competitors_latest.csv` مع تفعيل خيار كشط الويب. "
+                "ويلزم **كتالوج مهووس**: `data/mahwous_catalog.csv` أو سجلّ `our_catalog` في SQLite."
             )
 
 
@@ -2300,14 +2433,35 @@ elif page == "🔍 منتجات مفقودة":
             page_df = filtered.iloc[(pn-1)*PAGE_SIZE : pn*PAGE_SIZE]
 
             for idx, row in page_df.iterrows():
-                name  = str(row.get("منتج_المنافس", ""))
+                name = str(
+                    row.get("منتج_المنافس", "")
+                    or row.get("comp_name", "")
+                    or row.get("name", "")
+                    or row.get("الاسم", "")
+                    or ""
+                )
                 _miss_key = f"missing_{name}_{idx}"
                 if _miss_key in st.session_state.hidden_products:
                     continue
 
-                price           = safe_float(row.get("سعر_المنافس", 0))
-                brand           = str(row.get("الماركة", ""))
-                comp            = str(row.get("المنافس", ""))
+                price = safe_float(
+                    row.get("سعر_المنافس", 0)
+                    or row.get("comp_price", 0)
+                    or row.get("السعر", 0)
+                    or row.get("price", 0)
+                    or 0
+                )
+                brand = str(
+                    row.get("الماركة", "")
+                    or row.get("comp_brand", "")
+                    or row.get("brand", "")
+                    or ""
+                )
+                comp = str(
+                    row.get("المنافس", "")
+                    or row.get("competitor_name", "")
+                    or ""
+                )
                 size            = str(row.get("الحجم", ""))
                 ptype           = str(row.get("النوع", ""))
                 note            = str(row.get("ملاحظة", ""))
@@ -2331,8 +2485,10 @@ elif page == "🔍 منتجات مفقودة":
                 variant_product = str(row.get("منتج_متاح", ""))
                 variant_score   = safe_float(row.get("نسبة_التشابه", 0))
                 is_tester_flag  = bool(row.get("هو_تستر", False))
-                conf_level      = str(row.get("مستوى_الثقة", "green"))
-                conf_score      = safe_float(row.get("درجة_التشابه", 0))
+                conf_level = str(row.get("مستوى_الثقة", "yellow"))
+                conf_score = safe_float(
+                    row.get("درجة_التشابه", 0) or row.get("match_score", 0) or 0
+                )
                 suggested_price = round(price - 1, 2) if price > 0 else 0
 
                 _is_similar = "⚠️" in note
@@ -2922,7 +3078,7 @@ elif page == "🤖 الذكاء الصناعي":
                 placeholder="اسأل Gemini — عن المنتجات، الأسعار، التوصيات...",
                 label_visibility="collapsed")
         with _mc2:
-            _send = st.button("➤ إرسال", key="gem_send", type="primary", use_container_width=True)
+            _send = st.button("➤ إرسال", key="gem_send", type="primary", width="stretch")
 
         # أزرار سريعة
         _qc = st.columns(4)
@@ -2935,7 +3091,7 @@ elif page == "🤖 الذكاء الصناعي":
         ]
         for i, (lbl, q) in enumerate(_quick_labels):
             with _qc[i]:
-                if st.button(lbl, key=f"q{i}", use_container_width=True):
+                if st.button(lbl, key=f"q{i}", width="stretch"):
                     _quick = q
 
         _msg_to_send = _quick or (_user_in if _send and _user_in else None)
@@ -2975,7 +3131,7 @@ elif page == "🤖 الذكاء الصناعي":
 
         _pc1, _pc2 = st.columns(2)
         with _pc1:
-            if st.button("🤖 تحليل بـ Gemini", key="paste_go", type="primary", use_container_width=True):
+            if st.button("🤖 تحليل بـ Gemini", key="paste_go", type="primary", width="stretch"):
                 if _paste:
                     # إضافة سياق البيانات الحالية
                     _ctx_data = ""
@@ -2990,12 +3146,12 @@ elif page == "🤖 الذكاء الصناعي":
                         _pr = analyze_paste(_paste, _ctx_data)
                     st.markdown(f'<div class="ai-box">{_pr["response"]}</div>', unsafe_allow_html=True)
         with _pc2:
-            if st.button("📊 تحويل لجدول", key="paste_table", use_container_width=True):
+            if st.button("📊 تحويل لجدول", key="paste_table", width="stretch"):
                 if _paste:
                     try:
                         import io as _io
                         _df_p = pd.read_csv(_io.StringIO(_paste), sep=None, engine='python')
-                        st.dataframe(_df_p.head(200), use_container_width=True)
+                        st.dataframe(_df_p.head(200), width="stretch")
                         _csv_p = _df_p.to_csv(index=False, encoding="utf-8-sig").encode("utf-8-sig")
                         st.download_button("📄 تحميل CSV", data=_csv_p,
                             file_name="pasted.csv", mime="text/csv", key="paste_dl")
@@ -3197,7 +3353,7 @@ elif page == "⚡ أتمتة Make":
                 _prev_cols = ["المنتج","السعر","سعر_المنافس","الماركة"]
                 _prev_cols = [c for c in _prev_cols if c in df_s.columns]
                 if _prev_cols:
-                    st.dataframe(df_s[_prev_cols].head(10), use_container_width=True)
+                    st.dataframe(df_s[_prev_cols].head(10), width="stretch")
 
                 products = export_to_make_format(df_s, sec_type)
                 _sendable = [p for p in products if p.get("name") and p.get("price",0) > 0]
@@ -3221,7 +3377,7 @@ elif page == "⚡ أتمتة Make":
                  "وقت القرار": v.get("ts",""), "المنافس": v.get("competitor","")}
                 for k, v in pending.items()
             ])
-            st.dataframe(df_p.head(200), use_container_width=True)
+            st.dataframe(df_p.head(200), width="stretch")
 
             c1, c2 = st.columns(2)
             with c1:
@@ -3368,7 +3524,7 @@ elif page == "⚙️ الإعدادات":
                 "timestamp":"التاريخ","product_name":"المنتج",
                 "old_status":"من","new_status":"إلى",
                 "reason":"السبب","competitor":"المنافس"
-            }).head(200), use_container_width=True)
+            }).head(200), width="stretch")
         else:
             st.info("لا توجد قرارات مسجلة")
 
@@ -3397,7 +3553,7 @@ elif page == "📜 السجل":
                 "timestamp":"التاريخ","our_file":"ملف منتجاتنا",
                 "comp_file":"ملف المنافس","total_products":"الإجمالي",
                 "matched":"متطابق","missing":"مفقود"
-            }).head(200), use_container_width=True)
+            }).head(200), width="stretch")
         else:
             st.info("لا يوجد تاريخ")
 
@@ -3410,7 +3566,7 @@ elif page == "📜 السجل":
                 "product_name":"المنتج","competitor":"المنافس",
                 "old_price":"السعر السابق","new_price":"السعر الجديد",
                 "price_diff":"التغيير","new_date":"تاريخ التغيير"
-            }).head(200), use_container_width=True)
+            }).head(200), width="stretch")
         else:
             st.info(f"لا توجد تغييرات في آخر {days} يوم")
 
@@ -3421,7 +3577,7 @@ elif page == "📜 السجل":
             st.dataframe(df_e[["timestamp","page","event_type","details"]].rename(columns={
                 "timestamp":"التاريخ","page":"الصفحة",
                 "event_type":"الحدث","details":"التفاصيل"
-            }).head(200), use_container_width=True)
+            }).head(200), width="stretch")
         else:
             st.info("لا توجد أحداث")
 
@@ -3525,7 +3681,7 @@ elif page == "🔄 الأتمتة الذكية":
                             "old_price": "السعر الحالي", "new_price": "السعر الجديد",
                             "comp_price": "سعر المنافس",
                             "match_score": "تطابق%", "reason": "السبب"
-                        }), use_container_width=True, height=400)
+                        }), width="stretch", height=400)
 
                         # تصدير
                         _auto_excel = result["decisions"]
@@ -3646,7 +3802,7 @@ elif page == "🔄 الأتمتة الذكية":
                             confirmed[show_cols].rename(columns={
                                 "_verification_confidence": "ثقة AI%"
                             }),
-                            use_container_width=True
+                            width="stretch"
                         )
                     else:
                         st.info(
@@ -3732,7 +3888,7 @@ AUTOMATION_RULES_DEFAULT.append({
                 "action": "الإجراء", "old_price": "السعر القديم",
                 "new_price": "السعر الجديد", "competitor": "المنافس",
                 "match_score": "التطابق%", "pushed_to_make": "أُرسل؟"
-            }), use_container_width=True)
+            }), width="stretch")
         else:
             st.info("لا توجد قرارات مسجلة بعد — شغّل الأتمتة من التاب الأول")
 

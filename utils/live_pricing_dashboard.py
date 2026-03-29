@@ -284,7 +284,7 @@ def render_live_sidebar_controls() -> None:
         value=80,
         key="live_card_cap",
     )
-    if st.button("🔄 مزامنة الآن", use_container_width=True, key="live_sync_sidebar_btn"):
+    if st.button("🔄 مزامنة الآن", width="stretch", key="live_sync_sidebar_btn"):
         if sync_from_final_priced_csv():
             st.success("تمت المزامنة.")
         else:

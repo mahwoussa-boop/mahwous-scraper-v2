@@ -4,10 +4,16 @@
 - منتجات ناجحة تُدفع فوراً بعد التحليل (قبل دورة تصدير CSV الكاملة).
 - معاينة صفوف التسعير المصنّفة تُحدَّث من خط التسعير قبل/مع المزامنة إلى SQLite.
 - فشول حديثة مع سبب قصير للعرض التشخيصي.
+
+ملاحظة: الكاشط يُشغَّل غالباً في **عملية منفصلة** (run_background_worker)، لذا الذاكرة هنا
+لا تصل للواجهة. استخدم snapshot_products_cross_process / snapshot_failures_cross_process
+للقراءة من ملفات SQLite على القرص.
 """
 from __future__ import annotations
 
 import hashlib
+import os
+import sqlite3
 import threading
 import time
 from collections import deque
@@ -152,6 +158,191 @@ def snapshot_failures(limit: int = 50) -> List[Dict[str, Any]]:
     n = max(1, int(limit))
     with _LOCK:
         return list(_recent_failures)[-n:]
+
+
+def _data_path(*parts: str) -> str:
+    return os.path.join(os.getcwd(), *parts)
+
+
+def snapshot_products_cross_process(limit: int = 60) -> List[Dict[str, Any]]:
+    """
+    آخر منتجات ناجحة من القرص — يعمل عندما يكون الكاشط في subprocess.
+    يجمع: live_pricing_ui.scraped_competitor_live ثم scraper_state.product_state.
+    """
+    n = max(1, int(limit))
+    out: List[Dict[str, Any]] = []
+    seen_url: set = set()
+
+    def _add_row(
+        name: str,
+        price: float,
+        brand: str,
+        comp_url: str,
+        image_url: str,
+        sku: str,
+        ext: str,
+        ts_hint: str,
+    ) -> None:
+        u = (comp_url or "").strip()
+        if not u or u in seen_url:
+            return
+        seen_url.add(u)
+        out.append(
+            {
+                "ts": time.time(),
+                "name": name or "",
+                "price": float(price or 0),
+                "brand": brand or "",
+                "comp_url": u,
+                "image_url": image_url or "",
+                "sku": sku or "",
+                "Extraction_Method": (ext or "db").strip()[:120] or "db",
+                "image_status": "ok" if (image_url or "").strip() else "pending_search",
+                "updated_at": ts_hint,
+            }
+        )
+
+    live_db = _data_path("data", "live_pricing_ui.db")
+    if os.path.isfile(live_db):
+        try:
+            conn = sqlite3.connect(live_db, timeout=15)
+            conn.row_factory = sqlite3.Row
+            rows = conn.execute(
+                """
+                SELECT name, price, brand, image_url, sku, extraction_method, updated_at, comp_url
+                FROM scraped_competitor_live
+                ORDER BY updated_at DESC
+                LIMIT ?
+                """,
+                (n * 2,),
+            ).fetchall()
+            conn.close()
+            for r in rows:
+                if len(out) >= n:
+                    break
+                _add_row(
+                    str(r["name"] or ""),
+                    float(r["price"] or 0),
+                    str(r["brand"] or ""),
+                    str(r["comp_url"] or ""),
+                    str(r["image_url"] or ""),
+                    str(r["sku"] or ""),
+                    str(r["extraction_method"] or ""),
+                    str(r["updated_at"] or ""),
+                )
+        except Exception:
+            pass
+
+    state_db = _data_path("data", "scraper_state.db")
+    if len(out) < n and os.path.isfile(state_db):
+        try:
+            conn = sqlite3.connect(state_db, timeout=15)
+            conn.row_factory = sqlite3.Row
+            rows = conn.execute(
+                """
+                SELECT name, price, brand, image_url, sku, comp_url, last_seen_at
+                FROM product_state
+                ORDER BY last_seen_at DESC
+                LIMIT ?
+                """,
+                (n * 2,),
+            ).fetchall()
+            conn.close()
+            for r in rows:
+                if len(out) >= n:
+                    break
+                _add_row(
+                    str(r["name"] or ""),
+                    float(r["price"] or 0),
+                    str(r["brand"] or ""),
+                    str(r["comp_url"] or ""),
+                    str(r["image_url"] or ""),
+                    str(r["sku"] or ""),
+                    "product_state",
+                    str(r["last_seen_at"] or ""),
+                )
+        except Exception:
+            pass
+
+    return out[:n]
+
+
+def snapshot_failures_cross_process(limit: int = 50) -> List[Dict[str, Any]]:
+    """
+    آخر فشول مميّزة بـ URL (بدون تكرار نفس الرابط — أحدث خطأ فقط).
+    """
+    n = max(1, int(limit))
+    state_db = _data_path("data", "scraper_state.db")
+    if not os.path.isfile(state_db):
+        return []
+    try:
+        conn = sqlite3.connect(state_db, timeout=15)
+        rows = conn.execute(
+            """
+            SELECT url, last_error, updated_at
+            FROM url_queue
+            WHERE status = 'failed'
+              AND IFNULL(TRIM(last_error), '') != ''
+            ORDER BY updated_at DESC
+            LIMIT 800
+            """
+        ).fetchall()
+        conn.close()
+    except Exception:
+        return []
+
+    seen: set = set()
+    out: List[Dict[str, Any]] = []
+    for url, err, upd in rows:
+        u = (url or "").strip()
+        if not u or u in seen:
+            continue
+        seen.add(u)
+        out.append(
+            {
+                "ts": time.time(),
+                "url": u[:2000],
+                "reason": (err or "unknown").strip()[:500],
+                "updated_at": str(upd or ""),
+            }
+        )
+        if len(out) >= n:
+            break
+    return out
+
+
+def snapshot_products_for_ui(limit: int = 60) -> List[Dict[str, Any]]:
+    """للواجهة: دمج ذاكرة العملية الحالية + القرص (الأحدث يظهر أولاً)."""
+    n = max(1, int(limit))
+    disk = snapshot_products_cross_process(n)
+    mem = snapshot_products(n)
+    if not mem:
+        return disk
+    if not disk:
+        return mem
+    seen = {str(x.get("comp_url", "")).strip() for x in disk if x.get("comp_url")}
+    for m in reversed(mem):
+        u = str(m.get("comp_url", "") or "").strip()
+        if u and u not in seen:
+            seen.add(u)
+            disk.insert(0, m)
+    return disk[:n]
+
+
+def snapshot_failures_for_ui(limit: int = 50) -> List[Dict[str, Any]]:
+    disk = snapshot_failures_cross_process(limit)
+    mem = snapshot_failures(limit)
+    if not mem:
+        return disk
+    if not disk:
+        return mem
+    seen = {str(x.get("url", "")).strip() for x in disk}
+    for m in reversed(mem):
+        u = str(m.get("url", "") or "").strip()
+        if u and u not in seen:
+            seen.add(u)
+            disk.insert(0, m)
+    return disk[: max(1, int(limit))]
 
 
 def get_pricing_preview_for_bucket(bucket: str, limit: int) -> List[Dict[str, Any]]:

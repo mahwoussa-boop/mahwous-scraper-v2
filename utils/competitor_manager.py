@@ -1,3 +1,4 @@
+import csv
 import json
 import os
 import threading
@@ -5,6 +6,7 @@ import subprocess
 import sys
 import time
 import sqlite3
+from collections import deque
 from datetime import datetime, timedelta, timezone
 
 import pandas as pd
@@ -56,6 +58,20 @@ def _progress_looks_stuck(prog: dict) -> bool:
     return False
 
 
+def _product_state_row_count() -> int | None:
+    """عدد صفوف المنتجات الناجحة في SQLite (أدق من JSON أحياناً)."""
+    try:
+        db_path = os.path.join(os.getcwd(), "data", "scraper_state.db")
+        if not os.path.exists(db_path):
+            return None
+        conn = sqlite3.connect(db_path)
+        r = conn.execute("SELECT COUNT(1) FROM product_state").fetchone()
+        conn.close()
+        return int(r[0]) if r else 0
+    except Exception:
+        return None
+
+
 def _live_queue_counts_from_db() -> dict | None:
     """عدادات الطابور الحية من SQLite (أدق من JSON أثناء تنفيذ دفعة طويلة)."""
     try:
@@ -82,6 +98,43 @@ def _live_queue_counts_from_db() -> dict | None:
         }
     except Exception:
         return None
+
+
+def _read_scraper_progress_fresh() -> dict:
+    if not os.path.exists(_SCRAPER_PROGRESS):
+        return {}
+    try:
+        with open(_SCRAPER_PROGRESS, "r", encoding="utf-8") as _pf:
+            return json.load(_pf)
+    except Exception:
+        return {}
+
+
+def _csv_row_count_and_tail_df(path: str, tail_rows: int = 80) -> tuple[int, pd.DataFrame]:
+    """عدّ صفوف البيانات وإرجاع آخر tail_rows دون تحميل الملف كاملاً إلى ذاكرة."""
+    n_tail = max(1, int(tail_rows))
+    buf: deque = deque(maxlen=n_tail)
+    n_data = 0
+    header: list = []
+    try:
+        with open(path, "r", encoding="utf-8-sig", errors="replace", newline="") as f:
+            reader = csv.reader(f)
+            header = next(reader, None) or []
+            if not header:
+                return 0, pd.DataFrame()
+            width = len(header)
+            for row in reader:
+                n_data += 1
+                if len(row) < width:
+                    row = row + [""] * (width - len(row))
+                elif len(row) > width:
+                    row = row[:width]
+                buf.append(row)
+    except OSError:
+        return 0, pd.DataFrame()
+    if not buf:
+        return n_data, pd.DataFrame(columns=header)
+    return n_data, pd.DataFrame(list(buf), columns=header)
 
 
 def _reset_scraper_progress_and_stop_flag() -> None:
@@ -130,6 +183,30 @@ def save_competitors(competitors_list):
         json.dump(competitors_list, f, ensure_ascii=False, indent=4)
 
 
+def _competitors_df_for_display(df_in: pd.DataFrame) -> pd.DataFrame:
+    """توحيد أعمدة عرض جدول المنافسين (عربي)."""
+    d = df_in.copy()
+    col_map = {
+        "name": "الاسم",
+        "price": "السعر",
+        "brand": "الماركة",
+        "image_url": "رابط_الصورة",
+        "comp_image_url": "رابط_الصورة",
+        "comp_url": "رابط_المنتج",
+        "url": "رابط_المنتج",
+    }
+    for en, ar in col_map.items():
+        if en in d.columns and ar not in d.columns:
+            d[ar] = d[en]
+    if "sku" not in d.columns:
+        d["sku"] = ""
+    table_cols = ["الاسم", "السعر", "الماركة", "رابط_الصورة", "رابط_المنتج", "sku"]
+    for c in table_cols:
+        if c not in d.columns:
+            d[c] = ""
+    return d[table_cols]
+
+
 def render_competitor_management_ui():
     st.markdown("## 🏢 إدارة روابط المنافسين (Sitemaps)")
     with st.expander("ℹ️ تعليمات الإضافة", expanded=False):
@@ -168,7 +245,7 @@ def render_competitor_management_ui():
         with col2:
             st.write("")
             st.write("")
-            submitted = st.form_submit_button("➕ إضافة", use_container_width=True)
+            submitted = st.form_submit_button("➕ إضافة", width="stretch")
 
         if submitted:
             if not (new_url and new_url.strip()):
@@ -199,7 +276,7 @@ def render_competitor_management_ui():
             # ترتيب أعمدة العرض ليكون ثابتاً وواضحاً
             keep_cols = [c for c in ["name", "domain", "sitemap"] if c in df_view.columns]
             df_view = df_view[keep_cols] if keep_cols else df_view
-            st.dataframe(df_view, use_container_width=True, hide_index=True)
+            st.dataframe(df_view, width="stretch", hide_index=True)
             st.markdown("#### 🗑️ حذف منافس")
             options = [f"{r['name']} — {r['sitemap']}" for r in normalized_rows]
             pick = st.selectbox(
@@ -209,7 +286,7 @@ def render_competitor_management_ui():
                 key="competitor_delete_pick",
             )
             del_idx = options.index(pick) if options else -1
-            if st.button("🗑️ حذف المحدد", key="competitor_delete_btn", use_container_width=True):
+            if st.button("🗑️ حذف المحدد", key="competitor_delete_btn", width="stretch"):
                 if del_idx >= 0:
                     competitors.pop(del_idx)
                     save_competitors(competitors)
@@ -301,8 +378,9 @@ def render_competitor_scrape_page():  # noqa: C901
         frac = done_urls / total_urls
         st.progress(min(1.0, frac))
         st.caption(
-            f"**تقدّم الطابور:** تم معالجة **{done_urls:,} / {total_urls:,}** رابط منتج "
-            f"(≈ **{frac * 100:.1f}%**) — يُحفظ كل صف فوراً في SQLite ثم يُصدَّر إلى CSV."
+            f"**تقدّم الطابور:** تمت محاولة **{done_urls:,} / {total_urls:,}** رابط "
+            f"(≈ **{frac * 100:.1f}%**). "
+            "**نجاح الاستخراج فقط** يضيف صفاً إلى `product_state` وCSV — الفشل (حظر/parse) لا يزيد الصفوف."
         )
         c1, c2, c3 = st.columns(3)
         with c1:
@@ -311,7 +389,9 @@ def render_competitor_scrape_page():  # noqa: C901
                 f"{disp['urls_processed']:,} / {max(disp['urls_total'], 1):,}",
             )
         with c2:
-            st.metric("صفوف محفوظة في CSV", f"{prog.get('rows_in_csv', 0):,}")
+            _pc = _product_state_row_count()
+            _rows_shown = _pc if _pc is not None else int(prog.get("rows_in_csv", 0) or 0)
+            st.metric("صفوف ناجحة (SQLite → CSV)", f"{_rows_shown:,}")
         with c3:
             st.caption(
                 f"✅ مكتمل: **{disp['urls_completed']:,}** · "
@@ -347,7 +427,7 @@ def render_competitor_scrape_page():  # noqa: C901
             step=1,
         )
 
-        if st.button("🛑 إيقاف الآن", use_container_width=True, disabled=stop_flag):
+        if st.button("🛑 إيقاف الآن", width="stretch", disabled=stop_flag):
             os.makedirs("data", exist_ok=True)
             with open(STOP_FLAG_PATH, "w", encoding="utf-8") as f:
                 f.write(str(datetime.now(timezone.utc).isoformat()))
@@ -414,15 +494,30 @@ def render_competitor_scrape_page():  # noqa: C901
         except Exception:
             q_df = pd.DataFrame()
         if not q_df.empty:
-            st.dataframe(q_df, use_container_width=True, hide_index=True)
+            st.dataframe(q_df, width="stretch", hide_index=True)
 
-    # تحقق من وجود كتالوج مهووس قبل السماح بالكشط
+    # كتالوج مهووس: الجلسة أولاً، ثم SQLite (our_catalog) إن وُجد
     our_df = getattr(st.session_state, "our_df", None)
     has_store = isinstance(our_df, pd.DataFrame) and not our_df.empty
     if not has_store:
+        try:
+            from utils.pricing_pipeline import _load_our_catalog_df
+
+            _odb = _load_our_catalog_df()
+            if _odb is not None and not _odb.empty:
+                our_df = _odb
+                has_store = True
+                st.success(
+                    "✅ **تُحمَّل منتجاتكم من قاعدة SQLite** (`our_catalog`) — "
+                    "أقسام التحليل والمقارنة تعمل دون رفع ملف في هذه الجلسة."
+                )
+        except Exception:
+            pass
+    if not has_store:
         st.info(
-            "ℹ️ **بلا كتالوج محمّل في الجلسة:** يمكنك تشغيل الكشط؛ "
-            "أما جدول «مفقود مقابل مهووس» ف يحتاج رفع ملف من «📂 رفع الملفات» أو وجود `data/mahwous_catalog.csv`."
+            "ℹ️ **بلا كتالوج في الجلسة أو في القاعدة:** يمكنك تشغيل الكشط؛ "
+            "لتفعيل **أقسام التسعير** (أعلى/أقل/موافق/مفقود) ارفع ملفاً من «📂 رفع الملفات» "
+            "أو عُدْ بكتالوج سابق ليُملأ `our_catalog` في SQLite."
         )
 
     if os.path.exists(STOP_FLAG_PATH):
@@ -443,7 +538,7 @@ def render_competitor_scrape_page():  # noqa: C901
         start_disabled = prog_running
         if st.button(
             "🚀 بدء جلب بيانات المنافسين الآن",
-            use_container_width=True,
+            width="stretch",
             disabled=start_disabled,
             key="btn_start_scrape_page",
         ):
@@ -534,7 +629,7 @@ def render_competitor_scrape_page():  # noqa: C901
         )
         live_placeholder.dataframe(
             missing_df,
-            use_container_width=True,
+            width="stretch",
             hide_index=True,
         )
 
@@ -550,41 +645,41 @@ def render_competitor_scrape_page():  # noqa: C901
     )
     try:
         from streamlit import fragment as st_fragment
-        from utils.scrape_live_buffer import snapshot_failures, snapshot_products
+        from utils.scrape_live_buffer import snapshot_failures_for_ui, snapshot_products_for_ui
 
         @st_fragment(run_every=timedelta(seconds=2))
         def _scrape_buffer_fragment():
-            prods = snapshot_products(50)
-            fails = snapshot_failures(40)
+            prods = snapshot_products_for_ui(80)
+            fails = snapshot_failures_for_ui(60)
             c1, c2 = st.columns(2)
             with c1:
-                st.markdown("**✅ آخر نجاحات (الذاكرة)**")
+                st.markdown("**✅ آخر نجاحات (SQLite / الذاكرة)**")
                 if prods:
-                    st.dataframe(pd.DataFrame(prods), use_container_width=True, hide_index=True)
+                    st.dataframe(pd.DataFrame(prods), width="stretch", hide_index=True)
                 else:
                     st.caption("لا صفوف بعد — مع أول رابط ناجح يظهر الجدول فوراً.")
             with c2:
                 st.markdown("**📛 آخر فشل + السبب**")
                 if fails:
-                    st.dataframe(pd.DataFrame(fails), use_container_width=True, hide_index=True)
+                    st.dataframe(pd.DataFrame(fails), width="stretch", hide_index=True)
                 else:
                     st.caption("—")
 
         _scrape_buffer_fragment()
     except Exception:
         try:
-            from utils.scrape_live_buffer import snapshot_failures, snapshot_products
+            from utils.scrape_live_buffer import snapshot_failures_for_ui, snapshot_products_for_ui
 
-            prods = snapshot_products(50)
-            fails = snapshot_failures(40)
+            prods = snapshot_products_for_ui(50)
+            fails = snapshot_failures_for_ui(40)
             st.dataframe(
                 pd.DataFrame(prods) if prods else pd.DataFrame({"msg": ["لا بيانات"]}),
-                use_container_width=True,
+                width="stretch",
                 hide_index=True,
             )
             st.dataframe(
                 pd.DataFrame(fails) if fails else pd.DataFrame({"msg": ["لا فشول مسجلة"]}),
-                use_container_width=True,
+                width="stretch",
                 hide_index=True,
             )
         except Exception:
@@ -611,7 +706,7 @@ def render_competitor_scrape_page():  # noqa: C901
                             fail_rows,
                             columns=["url", "last_error", "attempt_count", "updated_at"],
                         ),
-                        use_container_width=True,
+                        width="stretch",
                         hide_index=True,
                     )
                 else:
@@ -655,6 +750,17 @@ def render_competitor_scrape_page():  # noqa: C901
         if df_fp is not None and not df_fp.empty:
             buckets = bucket_final_priced_df(df_fp)
             counts = summarize_buckets(buckets)
+            comp_path_quick = os.path.join(os.getcwd(), "data", "competitors_latest.csv")
+            if os.path.isfile(comp_path_quick):
+                try:
+                    _ncomp = len(pd.read_csv(comp_path_quick, encoding="utf-8-sig", usecols=[0]))
+                except Exception:
+                    _ncomp = 0
+                if _ncomp > max(len(df_fp), 1) * 2:
+                    st.caption(
+                        f"💡 **أقسام التسعير** تعرض صفوف **المطابَكة** فقط ({len(df_fp)} صف في `final_priced_latest.csv`)، "
+                        f"بينما كشط المنافس يضم **~{_ncomp}** صفاً — الباقي في الجدول «البيانات المسحوبة» أسفل الصفحة."
+                    )
             bcols = st.columns(5)
             bucket_order = ["higher", "lower", "ok", "missing", "review"]
             short_lbl = {
@@ -677,9 +783,12 @@ def render_competitor_scrape_page():  # noqa: C901
                     st.markdown(f"**{title}** — {desc}")
                     show = trim_for_display(buckets.get(bid, pd.DataFrame()))
                     if show.empty:
-                        st.info("لا صفوف في هذا القسم حالياً.")
+                        st.info(
+                            "لا صفوف في هذا القسم — إما لا توجد مطابقة بهذه الحالة، "
+                            "أو خط التسعير لم يُحدّث بعد. راجع الجدول «البيانات المسحوبة من المنافسين» أسفل الصفحة."
+                        )
                     else:
-                        st.dataframe(show, use_container_width=True, hide_index=True)
+                        st.dataframe(show, width="stretch", hide_index=True)
             if has_store and os.path.isfile(os.path.join(os.getcwd(), "data", "competitors_latest.csv")):
                 try:
                     df_c = pd.read_csv(os.path.join(os.getcwd(), "data", "competitors_latest.csv"), encoding="utf-8-sig")
@@ -691,7 +800,7 @@ def render_competitor_scrape_page():  # noqa: C901
                         st.caption(
                             "يستكمل قسم «منتجات مفقودة» في خط التسعير؛ مفيد قبل اكتمال تشغيل Gemini."
                         )
-                        st.dataframe(csv_miss, use_container_width=True, hide_index=True)
+                        st.dataframe(csv_miss, width="stretch", hide_index=True)
         else:
             st.info("ملف `final_priced_latest.csv` فارغ — انتظر اكتمال دفعة كشط ثم خط التسعير التلقائي.")
     else:
@@ -701,87 +810,142 @@ def render_competitor_scrape_page():  # noqa: C901
         )
 
     meta_path = os.path.join(os.getcwd(), "data", "scraper_last_run.json")
-    if os.path.exists(meta_path):
-        try:
-            with open(meta_path, "r", encoding="utf-8") as _mf:
-                sm = json.load(_mf)
-            st.markdown("### 📈 ملخص أداء آخر كشط")
-            st.caption(
-                f"آخر تحديث (UTC): `{sm.get('finished_at', '—')}` · الحالة: **{sm.get('status', '—')}**"
-            )
+    data_path = os.path.join(os.getcwd(), "data", "competitors_latest.csv")
+
+    st.markdown("### 📈 ملخص الكشط + معاينة الجدول (مباشر)")
+    st.caption(
+        "يُحدَّث هذا القسم تلقائياً كل ~2.5 ثانية أثناء الكشط: عدادات الطابور، صفوف SQLite، و**آخر صفوف** من CSV دون إعادة تحميل الصفحة."
+    )
+    try:
+        from streamlit import fragment as st_fragment
+
+        @st_fragment(run_every=timedelta(seconds=2.5))
+        def _live_scrape_overview_fragment():
+            prog_f = _read_scraper_progress_fresh()
+            stuck_f = _progress_looks_stuck(prog_f)
+            running_f = bool(prog_f.get("running")) and not stuck_f
+            live_q = _live_queue_counts_from_db()
+            if live_q:
+                disp = live_q
+            else:
+                disp = {
+                    "urls_total": max(int(prog_f.get("urls_total", 0) or 0), 0),
+                    "urls_processed": int(prog_f.get("urls_processed", 0) or 0),
+                    "urls_completed": int(prog_f.get("urls_completed", 0) or 0),
+                    "urls_failed": int(prog_f.get("urls_failed", 0) or 0),
+                    "urls_pending": int(prog_f.get("urls_pending", 0) or 0),
+                }
+            if disp["urls_total"] <= 0:
+                disp["urls_total"] = max(int(prog_f.get("urls_total", 0) or 0), 1)
+
+            _pc = _product_state_row_count()
+            rows_live = _pc if _pc is not None else int(prog_f.get("rows_in_csv", 0) or 0)
+
+            if running_f:
+                st.success("🟢 **الكشط يعمل** — الأرقام أدناه تُحدَّث من الطابور و`scraper_progress.json`.")
+            elif stuck_f:
+                st.warning("⚠️ **حالة عالقة** — راجع «إصلاح الحالة العالقة» أعلاه إن لزم.")
+
             c1, c2, c3, c4 = st.columns(4)
             with c1:
-                st.metric("روابط في الطابور", f"{sm.get('urls_queued', 0):,}")
+                st.metric("روابط في الطابور", f"{int(disp['urls_total']):,}")
             with c2:
-                st.metric("صفوف في CSV", f"{sm.get('rows_written_csv', 0):,}")
+                st.metric("مُعالَج (نجاح+فشل)", f"{int(disp['urls_processed']):,}")
             with c3:
-                st.metric("نسبة النجاح", f"{sm.get('success_rate_pct', 0.0):.1f}%")
+                pr = int(disp["urls_processed"])
+                ok = int(disp["urls_completed"])
+                live_pct = (100.0 * ok / float(max(pr, 1))) if pr else 0.0
+                st.metric("نجاح الطلبات (طابور)", f"{live_pct:.1f}%")
             with c4:
-                st.metric("المدة (ث)", f"{sm.get('duration_seconds', 0):.1f}")
-            c5, c6, c7 = st.columns(3)
-            with c5:
-                st.metric("قبل إزالة التكرار", f"{sm.get('rows_extracted_before_dedupe', 0):,}")
-            with c6:
-                st.metric("طلبات فاشلة (استثناء)", f"{sm.get('fetch_exceptions', 0):,}")
-            with c7:
-                st.metric("بدون استخراج (فراغ)", f"{sm.get('parse_null', 0):,}")
-            diag = sm.get("sitemap_diagnostics") or []
-            if diag:
-                with st.expander("🔎 تشخيص روابط الـ Sitemap (حالة HTTP وأخطاء الجلب)", expanded=False):
-                    st.dataframe(pd.DataFrame(diag), use_container_width=True, hide_index=True)
+                st.metric("صفوف ناجحة (SQLite→CSV)", f"{rows_live:,}")
+            st.caption(
+                f"✅ مكتمل: **{int(disp['urls_completed']):,}** · ❌ فشل: **{int(disp['urls_failed']):,}** · "
+                f"⏳ بالانتظار: **{int(disp['urls_pending']):,}** · "
+                f"Sitemap: `{prog_f.get('current_sitemap', '—')}`"
+            )
+
+            if not running_f and os.path.isfile(meta_path):
+                try:
+                    with open(meta_path, "r", encoding="utf-8") as _mf:
+                        sm = json.load(_mf)
+                    st.markdown("#### 📋 ملخص آخر دورة منتهية (`scraper_last_run.json`)")
                     st.caption(
-                        "إذا ظهرت حالة **410 Gone** أو **404** فالرابط لم يعد متاحاً على الخادم — "
-                        "استبدله برابط sitemap حديث من المتجر (أو من لوحة تحكم سلة/زد)."
+                        f"UTC: `{sm.get('finished_at', '—')}` · الحالة: **{sm.get('status', '—')}**"
                     )
-        except Exception:
-            pass
+                    s1, s2, s3, s4 = st.columns(4)
+                    with s1:
+                        st.metric("طابور (ملف)", f"{sm.get('urls_queued', 0):,}")
+                    with s2:
+                        _sm_rows = _product_state_row_count()
+                        st.metric(
+                            "صفوف CSV",
+                            f"{_sm_rows if _sm_rows is not None else int(sm.get('rows_written_csv', 0) or 0):,}",
+                        )
+                    with s3:
+                        st.metric("نسبة النجاح (دورة)", f"{sm.get('success_rate_pct', 0.0):.1f}%")
+                    with s4:
+                        st.metric("المدة (ث)", f"{sm.get('duration_seconds', 0):.1f}")
+                    s5, s6, s7 = st.columns(3)
+                    with s5:
+                        st.metric("قبل إزالة التكرار", f"{sm.get('rows_extracted_before_dedupe', 0):,}")
+                    with s6:
+                        st.metric("طلبات فاشلة (استثناء)", f"{sm.get('fetch_exceptions', 0):,}")
+                    with s7:
+                        st.metric("بدون استخراج (فراغ)", f"{sm.get('parse_null', 0):,}")
+                    diag = sm.get("sitemap_diagnostics") or []
+                    if diag:
+                        with st.expander("🔎 تشخيص روابط الـ Sitemap", expanded=False):
+                            st.dataframe(pd.DataFrame(diag), width="stretch", hide_index=True)
+                            st.caption(
+                                "**410 Gone** أو **404** تعني أن الرابط لم يعد متاحاً — استبدل الـ sitemap."
+                            )
+                except Exception:
+                    pass
 
-    st.markdown("### 📊 البيانات المسحوبة من المنافسين")
-    data_path = os.path.join(os.getcwd(), "data", "competitors_latest.csv")
-    if os.path.exists(data_path):
-        try:
-            df_comp = pd.read_csv(data_path)
-            if df_comp.empty:
-                st.warning(
-                    "⚠️ الملف موجود لكنه فارغ. تحقق من الـ Sitemap أو انتظر أول دفعة بعد بدء الكشط."
+            st.markdown("#### 📊 آخر صفوف في `competitors_latest.csv`")
+            if os.path.isfile(data_path):
+                n_lines, tail = _csv_row_count_and_tail_df(data_path, 100)
+                st.caption(
+                    f"إجمالي صفوف البيانات في الملف: **{n_lines:,}** — المعاينة: آخر **{len(tail)}** صفاً (يُحدَّث مع الكشط)."
                 )
+                if n_lines == 0 and tail.empty:
+                    st.warning("⚠️ الملف موجود لكنه فارغ أو يحتوي رؤوساً فقط — انتظر أول تصدير ناجح.")
+                elif not tail.empty:
+                    st.dataframe(
+                        _competitors_df_for_display(tail),
+                        width="stretch",
+                        height=380,
+                        hide_index=True,
+                    )
             else:
-                st.success(
-                    f"✅ **{len(df_comp)}** صف محفوظ — يُحدَّث أثناء الكشط إن كان يعملاً."
+                st.info(
+                    "لا يوجد `competitors_latest.csv` بعد. اضغط **بدء جلب** أعلاه — سيُنشأ ويُملأ تدريجياً."
                 )
-                # توحيد الأعمدة لعرض جدولي واضح بالصيغة العربية المطلوبة
-                d = df_comp.copy()
-                col_map = {
-                    "name": "الاسم",
-                    "price": "السعر",
-                    "brand": "الماركة",
-                    "image_url": "رابط_الصورة",
-                    "comp_image_url": "رابط_الصورة",
-                    "comp_url": "رابط_المنتج",
-                    "url": "رابط_المنتج",
-                }
-                for en, ar in col_map.items():
-                    if en in d.columns and ar not in d.columns:
-                        d[ar] = d[en]
-                if "sku" not in d.columns:
-                    d["sku"] = ""
 
-                table_cols = ["الاسم", "السعر", "الماركة", "رابط_الصورة", "رابط_المنتج", "sku"]
-                for c in table_cols:
-                    if c not in d.columns:
-                        d[c] = ""
-                d = d[table_cols]
-                st.dataframe(d, use_container_width=True, height=400, hide_index=True)
-                st.download_button(
-                    "📥 تنزيل CSV",
-                    data=df_comp.to_csv(index=False, encoding="utf-8-sig").encode("utf-8-sig"),
-                    file_name="competitors_latest.csv",
-                    mime="text/csv",
-                    key="dl_competitors_csv_page",
-                )
+        _live_scrape_overview_fragment()
+    except Exception as ex:
+        st.warning(f"تعذّر تفعيل المراقبة الحية: {ex}")
+        if os.path.exists(meta_path):
+            try:
+                with open(meta_path, "r", encoding="utf-8") as _mf:
+                    sm = json.load(_mf)
+                st.metric("صفوف CSV (ملخص)", int(sm.get("rows_written_csv", 0) or 0))
+            except Exception:
+                pass
+
+    st.markdown("### 📥 تنزيل الملف الكامل (`competitors_latest.csv`)")
+    if os.path.isfile(data_path):
+        try:
+            df_comp = pd.read_csv(data_path, encoding="utf-8-sig", errors="replace")
+            st.caption(f"الملف الحالي: **{len(df_comp):,}** صفاً — التنزيل يقرأ النسخة الكاملة.")
+            st.download_button(
+                "📥 تنزيل CSV",
+                data=df_comp.to_csv(index=False, encoding="utf-8-sig").encode("utf-8-sig"),
+                file_name="competitors_latest.csv",
+                mime="text/csv",
+                key="dl_competitors_csv_page",
+            )
         except Exception as e:
-            st.error(f"❌ حدث خطأ في قراءة ملف البيانات: {str(e)}")
+            st.error(f"❌ تعذّر قراءة الملف للتنزيل: {e}")
     else:
-        st.info(
-            "لا يوجد ملف بعد. اضغط **بدء جلب** أعلاه — سيُنشأ `competitors_latest.csv` ويُملأ تدريجياً."
-        )
+        st.caption("يظهر زر التنزيل بعد إنشاء الملف.")
