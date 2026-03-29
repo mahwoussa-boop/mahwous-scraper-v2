@@ -431,3 +431,13 @@ def run_auto_pricing_pipeline_background(reason: str = "", changed_rows: int = 0
         return False
     finally:
         _AUTO_PIPELINE_LOCK.release()
+
+
+def run_pricing_pipeline_immediate(reason: str = "manual_script") -> bool:
+    """
+    تشغيل خط التسعير فوراً مع تجاوز نافذة debounce (مفيد بعد انتهاء كشط كامل من سكربت).
+    """
+    global _LAST_AUTO_PIPELINE_AT
+
+    _LAST_AUTO_PIPELINE_AT = 0.0
+    return run_auto_pricing_pipeline_background(reason=reason, changed_rows=1)
