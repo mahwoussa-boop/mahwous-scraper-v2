@@ -1,12 +1,16 @@
 """
-Async competitor sitemap scraper — يقرأ روابط Sitemap من data/competitors_list.json
-ويُخرج data/competitors_latest.csv
+Continuous competitor scraper + resilient state.
 
-استخراج JSON-LD أولاً (Salla / Zid) ثم وسوم meta — أقل اعتماداً على CSS.
+Features:
+1) SQLite state (pending/completed/failed) with resume on restart/crash.
+2) Sitemap sync every 2 hours (discover new URLs without duplicates).
+3) Price-change prioritization in competitors_latest.csv (new/changed on top).
+4) Auto-trigger AI pricing pipeline in background after updated batches.
 """
 from __future__ import annotations
 
 import asyncio
+import ast
 import hashlib
 import json
 import logging
@@ -14,24 +18,178 @@ import os
 import random
 import re
 import shutil
+import sqlite3
 import time
 import xml.etree.ElementTree as ET
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional
-from urllib.parse import urlparse
+from datetime import timedelta
+from dataclasses import dataclass
+from typing import Any, Dict, List, Optional, Tuple
+from urllib.parse import urlparse, unquote
 
 import aiohttp
 import pandas as pd
 from bs4 import BeautifulSoup
+from config import MAIN_STORE_DOMAIN, is_main_store_domain
+from utils.scrape_live_buffer import push_scrape_failure, push_scraped_product
+from utils.sitemap_resolve import resolve_sitemap_url_async
 
 logger = logging.getLogger(__name__)
 
-SCRAPER_LAST_RUN_JSON = os.path.join("data", "scraper_last_run.json")
-SCRAPER_PROGRESS_JSON = os.path.join("data", "scraper_progress.json")
+DATA_DIR = "data"
+SCRAPER_LAST_RUN_JSON = os.path.join(DATA_DIR, "scraper_last_run.json")
+SCRAPER_PROGRESS_JSON = os.path.join(DATA_DIR, "scraper_progress.json")
+STATE_DB_PATH = os.path.join(DATA_DIR, "scraper_state.db")
+COMPETITOR_CSV = os.path.join(DATA_DIR, "competitors_latest.csv")
+COMPETITOR_TMP_CSV = os.path.join(DATA_DIR, "competitors_temp.csv")
+SCRAPER_STOP_FLAG_PATH = os.path.join(DATA_DIR, "scraper_stop.flag")
+COMPETITORS_FILE = os.path.join(DATA_DIR, "competitors_list.json")
+
+# لمنع تراكم الفشل/التكرار غير المفيد
+MAX_URL_ATTEMPTS = int(os.environ.get("SCRAPER_MAX_URL_ATTEMPTS", "3"))
+
+_USER_AGENTS: List[str] = [
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36 Edg/121.0.0.0",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Safari/605.1.15",
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:122.0) Gecko/20100101 Firefox/122.0",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:121.0) Gecko/20100101 Firefox/121.0",
+]
+
+_ACCEPT_LANGUAGES: List[str] = [
+    "ar-SA,ar;q=0.9,en-US;q=0.8,en;q=0.7",
+    "ar,en-US;q=0.9,en;q=0.8",
+    "en-US,en;q=0.9,ar-SA;q=0.8,ar;q=0.7",
+    "ar-SA,ar;q=0.95,en-GB;q=0.85,en;q=0.8",
+    "en-GB,en;q=0.9,ar;q=0.8",
+]
+
+# فلترة روابط غير المنتجات قبل الطابور
+_NON_PRODUCT_PATH_RE = re.compile(
+    r"/(cart|checkout|wishlist|basket|account|login|signin|signup|register|logout|"
+    r"privacy|policy|policies|terms|conditions|about|contact|faq|help|support|"
+    r"search|compare|orders?|thank-you|unsubscribe|subscribe|gift)",
+    re.I,
+)
+
+_SAR_PRICE_AFTER = re.compile(
+    r"(?:SAR|ر\.?\s*س(?:المملكة)?|ريال(?:\s*سعودي)?|SR)\s*[:\s]*"
+    r"(\d{1,3}(?:[,\s]\d{3})*(?:\.\d{1,3})?)",
+    re.I,
+)
+_SAR_PRICE_BEFORE = re.compile(
+    r"(\d{1,3}(?:[,\s]\d{3})*(?:\.\d{1,3})?)\s*(?:SAR|ر\.?\s*س|ريال|SR)\b",
+    re.I,
+)
+
+# تسلسل CSS: (وسم_التشخيص، محددات_الاسم، محددات_السعر)
+_HYBRID_CSS_LAYERS: List[Tuple[str, List[str], List[str]]] = [
+    (
+        "css_salla",
+        [
+            "h1.product__title",
+            "h1.detail__title",
+            ".product-title h1",
+            ".product-details h1",
+            "h1",
+        ],
+        [
+            ".product-price",
+            ".detail-price",
+            ".price-current",
+            "[data-product-price]",
+            ".price-wrapper .amount",
+            "span.price",
+            ".product-form__info .price",
+            ".product__price",
+        ],
+    ),
+    (
+        "css_shopify",
+        [
+            "h1.product__title",
+            "h1.product-single__title",
+            "[data-product-title]",
+            ".product-meta h1",
+            "h1.h0",
+            "h1",
+        ],
+        [
+            ".price-item--sale",
+            ".price-item--regular",
+            "span.product-price",
+            "[data-product-price]",
+            ".price .money",
+            ".price__regular .money",
+            "ins .money",
+            ".product__price",
+        ],
+    ),
+    (
+        "css_zid",
+        [
+            "h1.product-title",
+            "h1.detail-title",
+            ".product-details h1",
+            ".product-info h1",
+            "h1",
+        ],
+        [
+            ".product-price",
+            ".price-value",
+            "[data-price]",
+            ".current-price",
+            ".product-form .price",
+            ".price",
+        ],
+    ),
+    (
+        "css_schema_generic",
+        [
+            "[itemprop=name]",
+            "h1",
+        ],
+        [
+            "[itemprop=price]",
+            "meta[itemprop=price]",
+            "[data-price]",
+        ],
+    ),
+]
+
+
+@dataclass
+class ScrapeAttempt:
+    """نتيجة جلب رابط واحد (نجاح + صف المنتج، أو كود خطأ تشخيصي)."""
+
+    ok: bool
+    row: Optional[Dict[str, Any]] = None
+    error_code: str = ""
+    error_detail: str = ""
+    extraction_method: str = ""
+
+    def failure_message(self) -> str:
+        if self.ok:
+            return ""
+        parts = [self.error_code or "fail"]
+        if self.error_detail:
+            parts.append(self.error_detail[:240])
+        return " | ".join(parts)
+
+
+FAILED_RETENTION_HOURS = int(os.environ.get("SCRAPER_FAILED_RETENTION_HOURS", "72"))
+COMPLETED_RETENTION_HOURS = int(os.environ.get("SCRAPER_COMPLETED_RETENTION_HOURS", "168"))
+
+
+def _utc_now() -> str:
+    return datetime.now(timezone.utc).isoformat()
 
 
 def _write_scraper_last_run_meta(payload: Dict[str, Any]) -> None:
-    os.makedirs("data", exist_ok=True)
+    os.makedirs(DATA_DIR, exist_ok=True)
     with open(SCRAPER_LAST_RUN_JSON, "w", encoding="utf-8") as f:
         json.dump(payload, f, ensure_ascii=False, indent=2)
 
@@ -45,36 +203,489 @@ def _merge_scraper_progress(updates: Dict[str, Any]) -> None:
         except Exception:
             pass
     prev.update(updates)
-    os.makedirs("data", exist_ok=True)
+    os.makedirs(DATA_DIR, exist_ok=True)
     with open(SCRAPER_PROGRESS_JSON, "w", encoding="utf-8") as f:
         json.dump(prev, f, ensure_ascii=False, indent=2)
 
 
-def _save_competitor_csv_rows(rows: List[Dict[str, Any]]) -> int:
-    """يكتب competitors_latest.csv من قائمة صفوف. يعيد عدد الصفوف بعد إزالة التكرار."""
-    if not rows:
+def _get_state_conn() -> sqlite3.Connection:
+    os.makedirs(DATA_DIR, exist_ok=True)
+    conn = sqlite3.connect(STATE_DB_PATH, check_same_thread=False, timeout=30)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA journal_mode=WAL;")
+    conn.execute("PRAGMA busy_timeout=30000;")
+    return conn
+
+
+def _init_state_db() -> None:
+    conn = _get_state_conn()
+    cur = conn.cursor()
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS url_queue (
+            url TEXT PRIMARY KEY,
+            sitemap_url TEXT,
+            status TEXT NOT NULL DEFAULT 'pending',
+            attempt_count INTEGER NOT NULL DEFAULT 0,
+            last_error TEXT,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            last_seen_at TEXT NOT NULL
+        )
+        """
+    )
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS product_state (
+            comp_url TEXT PRIMARY KEY,
+            name TEXT,
+            price REAL,
+            brand TEXT,
+            image_url TEXT,
+            sku TEXT,
+            competitor TEXT,
+            is_new INTEGER NOT NULL DEFAULT 1,
+            changed INTEGER NOT NULL DEFAULT 1,
+            last_changed_at TEXT,
+            last_seen_at TEXT NOT NULL
+        )
+        """
+    )
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS scraper_meta (
+            key TEXT PRIMARY KEY,
+            value TEXT
+        )
+        """
+    )
+    conn.commit()
+    conn.close()
+
+
+def _load_competitor_sitemaps() -> List[Dict[str, str]]:
+    if not os.path.exists(COMPETITORS_FILE):
+        return []
+    try:
+        with open(COMPETITORS_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+            if not isinstance(data, list):
+                return []
+            out: List[Dict[str, str]] = []
+            for item in data:
+                if isinstance(item, dict):
+                    domain = str(item.get("domain", "")).strip()
+                    # بعض الإدخالات الفاسدة قد تخزن dict كنص/URL-encoded داخل domain.
+                    domain = _normalize_competitor_domain(domain)
+                    name = str(item.get("name", "")).strip() or domain
+                    if domain and not is_main_store_domain(domain):
+                        out.append({"name": name, "domain": domain})
+                elif isinstance(item, str):
+                    u = _normalize_competitor_domain(item.strip())
+                    # دعم حالات legacy التي خزّنت dict كنص
+                    if u.startswith("{") and "domain" in u:
+                        parsed = None
+                        try:
+                            parsed = json.loads(u)
+                        except Exception:
+                            try:
+                                parsed = ast.literal_eval(u)
+                            except Exception:
+                                parsed = None
+                        if isinstance(parsed, dict):
+                            d = str(parsed.get("domain", "")).strip()
+                            n = str(parsed.get("name", "")).strip() or d
+                            if d and not is_main_store_domain(d):
+                                out.append({"name": n, "domain": d})
+                            continue
+                    if u and not is_main_store_domain(u):
+                        out.append({"name": u, "domain": u})
+            return out
+    except Exception:
+        return []
+
+
+def _normalize_competitor_domain(raw: str) -> str:
+    """تنظيف إدخال المنافس: يدعم URL-encoded dict/string legacy."""
+    s = str(raw or "").strip()
+    if not s:
+        return ""
+    try:
+        dec = unquote(s).strip()
+        if dec:
+            s = dec
+    except Exception:
+        pass
+    if s.startswith("{") and "domain" in s:
+        parsed = None
+        try:
+            parsed = json.loads(s)
+        except Exception:
+            try:
+                parsed = ast.literal_eval(s)
+            except Exception:
+                parsed = None
+        if isinstance(parsed, dict):
+            s = str(parsed.get("domain", "")).strip()
+    return s
+
+
+def _is_processable_product_url(url: str) -> bool:
+    """يستبعد صفحات الحساب/السلة/السياسات وغيرها — يركّز الطابور على صفحات منتج محتملة."""
+    if not url or not str(url).strip().lower().startswith("http"):
+        return False
+    try:
+        p = urlparse(url.strip())
+        pl = (p.path or "").lower()
+    except Exception:
+        return False
+    if _NON_PRODUCT_PATH_RE.search(pl):
+        return False
+    if pl.endswith(".xml") or "sitemap" in pl:
+        return False
+    if any(
+        x in pl
+        for x in (
+            "/blog/",
+            "/blogs/",
+            "/magazine/",
+            "/news/",
+            "/article/",
+            "/tag/",
+            "/tags/",
+        )
+    ):
+        return False
+    if "/collection" in pl and "/products/" not in pl:
+        return False
+    if "/category" in pl and "/product" not in pl:
+        return False
+    if re.search(r"/p\d+$", pl):
+        return True
+    if "/products/" in pl:
+        return True
+    if re.search(r"/product/[^/]+", pl, re.I):
+        return True
+    if re.search(r"/item/[^/]+", pl, re.I):
+        return True
+    if re.search(r"-p-\d+(\.html)?$", pl, re.I):
+        return True
+    return False
+
+
+def _insert_discovered_urls(sitemap_url: str, urls: List[str]) -> int:
+    if not urls:
         return 0
-    _col_order = ["name", "price", "brand", "image_url", "comp_url", "sku"]
-    df = pd.DataFrame(rows).drop_duplicates(subset=["comp_url"])
-    for c in _col_order:
-        if c not in df.columns:
-            df[c] = ""
-    df = df[_col_order]
-    temp_file = "data/competitors_temp.csv"
-    final_file = "data/competitors_latest.csv"
-    df_ar = df.rename(
+    urls = [u for u in urls if _is_processable_product_url(u)]
+    if not urls:
+        return 0
+    now = _utc_now()
+    conn = _get_state_conn()
+    cur = conn.cursor()
+    inserted = 0
+    for u in urls:
+        cur.execute(
+            """
+            INSERT OR IGNORE INTO url_queue
+            (url, sitemap_url, status, attempt_count, last_error, created_at, updated_at, last_seen_at)
+            VALUES (?, ?, 'pending', 0, NULL, ?, ?, ?)
+            """,
+            (u, sitemap_url, now, now, now),
+        )
+        inserted += cur.rowcount
+        cur.execute(
+            "UPDATE url_queue SET last_seen_at=?, updated_at=? WHERE url=?",
+            (now, now, u),
+        )
+    conn.commit()
+    conn.close()
+    return inserted
+
+
+def _load_pending_urls(limit: int) -> List[str]:
+    want = max(1, int(limit))
+    fetch_n = min(max(want * 8, want), 4000)
+    conn = _get_state_conn()
+    rows = conn.execute(
+        """
+        SELECT url
+        FROM url_queue
+        WHERE status='pending'
+          AND attempt_count < ?
+        ORDER BY updated_at ASC, created_at ASC
+        LIMIT ?
+        """,
+        (int(MAX_URL_ATTEMPTS), fetch_n),
+    ).fetchall()
+    conn.close()
+    out: List[str] = []
+    for r in rows:
+        u = str(r["url"])
+        if _is_processable_product_url(u):
+            out.append(u)
+        if len(out) >= want:
+            break
+    return out
+
+
+def _mark_url_status(url: str, status: str, error: str = "") -> None:
+    now = _utc_now()
+    conn = _get_state_conn()
+    conn.execute(
+        """
+        UPDATE url_queue
+        SET status=?,
+            attempt_count=attempt_count+1,
+            last_error=?,
+            updated_at=?
+        WHERE url=?
+        """,
+        (status, error[:500], now, url),
+    )
+    conn.commit()
+    conn.close()
+
+
+def _upsert_product_and_get_change(row: Dict[str, Any]) -> Tuple[bool, bool]:
+    """Returns (is_new_or_changed, inserted_new)."""
+    comp_url = str(row.get("comp_url", "")).strip()
+    if not comp_url:
+        return (False, False)
+
+    price = float(row.get("price", 0) or 0)
+    now = _utc_now()
+    competitor = urlparse(comp_url).netloc.lower()
+
+    conn = _get_state_conn()
+    prev = conn.execute(
+        """
+        SELECT price FROM product_state WHERE comp_url=?
+        """,
+        (comp_url,),
+    ).fetchone()
+
+    if prev is None:
+        conn.execute(
+            """
+            INSERT INTO product_state
+            (comp_url, name, price, brand, image_url, sku, competitor, is_new, changed, last_changed_at, last_seen_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, 1, 1, ?, ?)
+            """,
+            (
+                comp_url,
+                str(row.get("name", "")),
+                price,
+                str(row.get("brand", "")),
+                str(row.get("image_url", "")),
+                str(row.get("sku", "")),
+                competitor,
+                now,
+                now,
+            ),
+        )
+        conn.commit()
+        conn.close()
+        return (True, True)
+
+    prev_price = float(prev["price"] or 0)
+    changed = abs(prev_price - price) > 1e-9
+    conn.execute(
+        """
+        UPDATE product_state
+        SET name=?,
+            price=?,
+            brand=?,
+            image_url=?,
+            sku=?,
+            competitor=?,
+            is_new=0,
+            changed=?,
+            last_changed_at=CASE WHEN ?=1 THEN ? ELSE last_changed_at END,
+            last_seen_at=?
+        WHERE comp_url=?
+        """,
+        (
+            str(row.get("name", "")),
+            price,
+            str(row.get("brand", "")),
+            str(row.get("image_url", "")),
+            str(row.get("sku", "")),
+            competitor,
+            1 if changed else 0,
+            1 if changed else 0,
+            now,
+            now,
+            comp_url,
+        ),
+    )
+    conn.commit()
+    conn.close()
+    return (changed, False)
+
+
+def _export_competitors_csv_prioritized() -> int:
+    conn = _get_state_conn()
+    rows = conn.execute(
+        """
+        SELECT
+            name,
+            price,
+            brand,
+            image_url,
+            comp_url,
+            sku,
+            is_new,
+            changed,
+            COALESCE(last_changed_at, last_seen_at) AS changed_ts,
+            last_seen_at
+        FROM product_state
+        ORDER BY
+            CASE WHEN is_new=1 OR changed=1 THEN 0 ELSE 1 END ASC,
+            changed_ts DESC,
+            last_seen_at DESC
+        """
+    ).fetchall()
+    conn.close()
+
+    if not rows:
+        if os.path.exists(COMPETITOR_CSV):
+            os.remove(COMPETITOR_CSV)
+        return 0
+
+    df = pd.DataFrame([dict(r) for r in rows])
+    out = df.rename(
         columns={
             "name": "الاسم",
             "price": "السعر",
             "brand": "الماركة",
             "image_url": "رابط_الصورة",
             "comp_url": "رابط_المنتج",
-            "sku": "sku",
         }
     )
-    df_ar.to_csv(temp_file, index=False, encoding="utf-8-sig")
-    shutil.move(temp_file, final_file)
-    return len(df)
+    out = out[["الاسم", "السعر", "الماركة", "رابط_الصورة", "رابط_المنتج", "sku"]]
+    tmp_path = os.path.join(
+        DATA_DIR,
+        f"competitors_temp_{os.getpid()}_{int(time.time())}.csv",
+    )
+    try:
+        out.to_csv(tmp_path, index=False, encoding="utf-8-sig")
+        # على ويندوز قد يحدث lock مؤقت على الملف الهدف (Excel/قارئ خارجي).
+        # استخدام tmp فريد يقلل احتمال القفل على نفس الملف.
+        for _ in range(3):
+            try:
+                os.replace(tmp_path, COMPETITOR_CSV)
+                tmp_path = ""  # moved successfully
+                break
+            except PermissionError:
+                time.sleep(0.4)
+    except PermissionError as e:
+        logger.warning("CSV export skipped بسبب قفل ملف: %s", e)
+        try:
+            if tmp_path and os.path.exists(tmp_path):
+                os.remove(tmp_path)
+        except Exception:
+            pass
+        # لا نكسر دورة الكشط؛ نُبقي الملف الحالي كما هو.
+        if os.path.exists(COMPETITOR_CSV):
+            try:
+                return int(len(pd.read_csv(COMPETITOR_CSV)))
+            except Exception:
+                return len(out)
+        return len(out)
+    finally:
+        # تنظيف tmp إن فشل النقل
+        try:
+            if tmp_path and os.path.exists(tmp_path):
+                os.remove(tmp_path)
+        except Exception:
+            pass
+    return len(out)
+
+
+def _get_queue_counters() -> Dict[str, int]:
+    conn = _get_state_conn()
+    rows = conn.execute(
+        "SELECT status, COUNT(*) AS cnt FROM url_queue GROUP BY status"
+    ).fetchall()
+    conn.close()
+    out = {"pending": 0, "completed": 0, "failed": 0}
+    for r in rows:
+        out[str(r["status"])] = int(r["cnt"])
+    return out
+
+
+def _progress_from_queue() -> Dict[str, Any]:
+    """للواجهة: «المعالَج» = مكتمل + فاشل (وليس المكتمل فقط)."""
+    q = _get_queue_counters()
+    pending = int(q.get("pending", 0) or 0)
+    completed = int(q.get("completed", 0) or 0)
+    failed = int(q.get("failed", 0) or 0)
+    total = pending + completed + failed
+    handled = completed + failed
+    return {
+        "urls_total": total,
+        "urls_processed": handled,
+        "urls_completed": completed,
+        "urls_failed": failed,
+        "urls_pending": pending,
+    }
+
+
+def _cleanup_state_queues() -> None:
+    """
+    تنظيف دوري لتقليل تراكم `url_queue`/التكرارات غير المفيدة.
+    الهدف: تشغيل مستمر بدون تضخم طابور الفشل.
+    """
+    try:
+        cutoff_failed = _utc_now_dt() - timedelta(hours=FAILED_RETENTION_HOURS)
+        cutoff_completed = _utc_now_dt() - timedelta(hours=COMPLETED_RETENTION_HOURS)
+        cutoff_failed_iso = cutoff_failed.isoformat()
+        cutoff_completed_iso = cutoff_completed.isoformat()
+
+        conn = _get_state_conn()
+        cur = conn.cursor()
+        # حذف الفشل القديم أو الذي تعدّى الحد
+        cur.execute(
+            """
+            DELETE FROM url_queue
+            WHERE (status='failed' AND attempt_count >= ?)
+               OR (status='failed' AND last_seen_at < ?)
+            """,
+            (MAX_URL_ATTEMPTS, cutoff_failed_iso),
+        )
+        # حذف المكتمل القديم (لا نريد تخزينه للأبد)
+        cur.execute(
+            """
+            DELETE FROM url_queue
+            WHERE status='completed' AND last_seen_at < ?
+            """,
+            (cutoff_completed_iso,),
+        )
+        conn.commit()
+        conn.close()
+    except Exception:
+        # لا نريد كسر الخدمة بسبب تنظيف غير حاسم
+        logger.exception("cleanup_state_queues failed")
+
+
+def _utc_now_dt() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+async def _trigger_ai_pipeline_async(reason: str, changed_rows: int) -> None:
+    """Runs matcher + Gemini pricing engine in background after updates."""
+    if changed_rows <= 0:
+        return
+    try:
+        from utils.pricing_pipeline import run_auto_pricing_pipeline_background
+
+        await asyncio.to_thread(
+            run_auto_pricing_pipeline_background,
+            reason=reason,
+            changed_rows=changed_rows,
+        )
+    except Exception as e:
+        logger.error("Auto pipeline trigger failed: %s", e)
 
 
 def _tag_local(tag: str) -> str:
@@ -127,8 +738,12 @@ def _extract_image_url_from_product(data: dict) -> str:
 
 
 def _filter_salla_like_product_urls(urls: List[str]) -> List[str]:
-    """يحتفظ بصفحات منتج سلة/زد النموذجية (.../اسم-المنتج/p123456789) ويستبعد المدونة والأقسام وروابط CDN."""
+    """
+    يحتفظ بصفحات منتج محتملة: سلة (…/p123)، زد/شوبيفاي (/products/)، مسارات تحتوي /product/، إلخ.
+    يستبعد CDN والمدونات الواضحة.
+    """
     out: List[str] = []
+    skip_blog = re.compile(r"/(blog|news|article|magazine|tag|category|collection)(/|$)", re.I)
     for u in urls:
         try:
             p = urlparse(u)
@@ -138,8 +753,23 @@ def _filter_salla_like_product_urls(urls: List[str]) -> List[str]:
         if "cdn.salla.sa" in host or host.startswith("cdn."):
             continue
         path = p.path or ""
+        if skip_blog.search(path):
+            continue
         if re.search(r"/p\d+$", path):
             out.append(u)
+            continue
+        if re.search(r"/products/[^/]+/?$", path, re.I):
+            out.append(u)
+            continue
+        if re.search(r"/product/[^/]+/?$", path, re.I):
+            out.append(u)
+            continue
+        if re.search(r"/item/[^/]+/?$", path, re.I):
+            out.append(u)
+            continue
+        if re.search(r"-p-\d+(\.html)?$", path, re.I):
+            out.append(u)
+            continue
     return list(dict.fromkeys(out))
 
 
@@ -208,26 +838,42 @@ def _first_product_node(obj: Any) -> Optional[dict]:
 
 
 class AsyncCompetitorScraper:
-    """جلب صفحات المنتجات — JSON-LD أولاً، ثم meta، مع حد تزامن وتأخير مهذب."""
+    """محرك هجين: JSON-LD → CSS منصات → Meta → Regex — مع تراجع تكيفي عند الحظر الناعم."""
 
     def __init__(self, concurrency_limit: int = 15):
         self.concurrency_limit = max(1, int(concurrency_limit))
         self.semaphore = asyncio.Semaphore(self.concurrency_limit)
+        self._adaptive_extra_delay = 0.0
+        self._backoff_lock = asyncio.Lock()
 
-    def _get_headers(self, referer: Optional[str] = None) -> Dict[str, str]:
-        """رؤوس واقعية لتقليل الحظر (Referer + Accept-Encoding + …)."""
-        ref = referer or "https://www.google.com/"
+    def _get_headers(
+        self,
+        referer: Optional[str] = None,
+        user_agent: Optional[str] = None,
+        url: Optional[str] = None,
+    ) -> Dict[str, str]:
+        """رؤوس متنوّعة (لغة، مرجع، وكيل) لتقليل بصمة آلية ثابتة."""
+        if referer is not None:
+            ref = referer
+        elif url and random.random() < 0.72:
+            ref = self._referer_for_url(url)
+        else:
+            ref = random.choice(
+                (
+                    "https://www.google.com/",
+                    "https://www.bing.com/",
+                    "https://duckduckgo.com/",
+                )
+            )
+        ua = (user_agent or random.choice(_USER_AGENTS)).strip()
+        accept_lang = random.choice(_ACCEPT_LANGUAGES)
         return {
-            "User-Agent": (
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-                "(KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
-            ),
+            "User-Agent": ua,
             "Accept": (
                 "text/html,application/xhtml+xml,application/xml;q=0.9,"
                 "image/avif,image/webp,image/apng,*/*;q=0.8"
             ),
-            "Accept-Language": "ar-SA,ar;q=0.9,en-US;q=0.8,en;q=0.7",
-            # بدون br: aiohttp يحتاج حزمة brotli لفك br؛ gzip/deflate كافٍ لمعظم الخوادم
+            "Accept-Language": accept_lang,
             "Accept-Encoding": "gzip, deflate",
             "Referer": ref,
             "DNT": "1",
@@ -347,45 +993,263 @@ class AsyncCompetitorScraper:
             "price": price_out,
             "brand": brand,
             "image_url": image_url,
+            "comp_image_url": image_url,
             "comp_url": url,
             "sku": sku,
         }
 
-    def _extract_meta_fallback(self, soup: BeautifulSoup, url: str) -> Optional[Dict[str, Any]]:
-        """وسوم meta ثابتة نسبياً (og / product)."""
+    def _meta_extract_name_price_img(self, soup: BeautifulSoup) -> Tuple[str, Optional[float], str]:
+        """اسم + سعر + صورة من meta / title (طبقة وسيطة)."""
         name_el = soup.find("meta", property="og:title") or soup.find(
             "meta", attrs={"name": "twitter:title"}
         )
-        price_el = (
-            soup.find("meta", property="product:price:amount")
-            or soup.find("meta", property="og:price:amount")
-            or soup.find("meta", attrs={"itemprop": "price"})
-        )
-        if not name_el or not name_el.get("content"):
-            if soup.title and soup.title.string:
-                name = str(soup.title.string).strip()
-            else:
-                return None
-        else:
+        name = ""
+        if name_el and name_el.get("content"):
             name = str(name_el["content"]).strip()
+        elif soup.title and soup.title.string:
+            name = str(soup.title.string).strip()
 
-        price = None
-        if price_el and price_el.get("content"):
-            price = _parse_price_from_text(str(price_el["content"]))
-        if price is None:
-            return None
+        price: Optional[float] = None
+        for pel in (
+            soup.find("meta", property="product:price:amount"),
+            soup.find("meta", property="og:price:amount"),
+            soup.find("meta", attrs={"itemprop": "price"}),
+        ):
+            if pel and pel.get("content"):
+                price = _parse_price_from_text(str(pel["content"]))
+                if price is not None:
+                    break
 
         og_img = soup.find("meta", property="og:image")
         image_url = str(og_img["content"]).strip() if og_img and og_img.get("content") else ""
+        return name, price, image_url
 
+    def _classify_soft_block(self, html: str, status: int) -> Tuple[bool, str]:
+        """كشف حظر ناعم: HTML قصير جداً أو صفحات تحقق/حظر."""
+        if status != 200:
+            return False, ""
+        if not html:
+            return True, "empty_html"
+        ln = len(html)
+        if ln < 2048:
+            return True, f"tiny_html_{ln}b_under_2kb"
+        head = html[:12000].lower()
+        keys = (
+            "captcha",
+            "cloudflare",
+            "forbidden",
+            "access denied",
+            "blocked",
+            "robot check",
+            "ddos protection",
+            "attention required",
+            "enable javascript",
+            "حظر",
+            "verify you are human",
+        )
+        if any(k in head for k in keys):
+            return True, "block_keyword_in_body"
+        return False, ""
+
+    def _css_pick_name_price(
+        self, soup: BeautifulSoup, name_sels: List[str], price_sels: List[str]
+    ) -> Tuple[str, Optional[float]]:
+        name = ""
+        for sel in name_sels:
+            try:
+                el = soup.select_one(sel)
+            except Exception:
+                continue
+            if el:
+                t = el.get_text(strip=True) if hasattr(el, "get_text") else ""
+                if t and 1 < len(t) < 800:
+                    name = t[:500]
+                    break
+        price_v: Optional[float] = None
+        for sel in price_sels:
+            try:
+                el = soup.select_one(sel)
+            except Exception:
+                continue
+            if not el:
+                continue
+            raw = (
+                el.get("content")
+                or el.get("data-price")
+                or el.get("data-product-price")
+                or el.get("data-current-price")
+                or el.get("data-price-amount")
+                or (el.get_text(strip=True) if hasattr(el, "get_text") else "")
+            )
+            p = _parse_price_from_text(str(raw or ""))
+            if p is not None and p > 0:
+                price_v = float(p)
+                break
+        return name, price_v
+
+    def _extract_css_layers(self, soup: BeautifulSoup, url: str) -> Optional[Tuple[Dict[str, Any], str]]:
+        host = urlparse(url).netloc.lower()
+        if "shopify" in host or "myshopify" in host:
+            prio = {"css_shopify": 0, "css_salla": 1, "css_zid": 2, "css_schema_generic": 3}
+        elif "zid" in host:
+            prio = {"css_zid": 0, "css_salla": 1, "css_shopify": 2, "css_schema_generic": 3}
+        elif "salla" in host:
+            prio = {"css_salla": 0, "css_zid": 1, "css_shopify": 2, "css_schema_generic": 3}
+        else:
+            prio = {m: i for i, (m, _, _) in enumerate(_HYBRID_CSS_LAYERS)}
+        ordered = sorted(_HYBRID_CSS_LAYERS, key=lambda x: prio.get(x[0], 99))
+
+        for method, ns, ps in ordered:
+            n, p = self._css_pick_name_price(soup, ns, ps)
+            if n and p and p > 0:
+                og_img = soup.find("meta", property="og:image")
+                img = str(og_img["content"]).strip() if og_img and og_img.get("content") else ""
+                return (
+                    {
+                        "name": n,
+                        "price": float(p),
+                        "brand": "",
+                        "image_url": img,
+                        "comp_image_url": img,
+                        "comp_url": url,
+                        "sku": _stable_sku_from_url(url),
+                    },
+                    method,
+                )
+        return None
+
+    def _extract_regex_layer(self, html: str, soup: BeautifulSoup, url: str) -> Optional[Dict[str, Any]]:
+        chunk = html[: min(len(html), 900_000)]
+        found: List[float] = []
+        for rx in (_SAR_PRICE_AFTER, _SAR_PRICE_BEFORE):
+            for m in rx.finditer(chunk):
+                v = _parse_price_from_text(m.group(1))
+                if v is not None and 3.0 < v < 250_000:
+                    found.append(float(v))
+        if not found:
+            for pat in (
+                r'"price"\s*:\s*"?([\d.,]+)"?',
+                r'product:price:amount"\s+content="([\d.,]+)"',
+            ):
+                mm = re.search(pat, chunk, re.I)
+                if mm:
+                    v = _parse_price_from_text(mm.group(1))
+                    if v is not None and 3.0 < v < 250_000:
+                        found.append(float(v))
+        if not found:
+            return None
+        price = max(found)
+        name = ""
+        og = soup.find("meta", property="og:title")
+        if og and og.get("content"):
+            name = str(og["content"]).strip()
+        if not name and soup.title and soup.title.string:
+            name = str(soup.title.string).strip()
+        name = re.split(r"\s*[\-|–|]\s*", name, maxsplit=1)[0].strip()[:400]
+        if not name or len(name) < 2:
+            return None
+        og_img = soup.find("meta", property="og:image")
+        img = str(og_img["content"]).strip() if og_img and og_img.get("content") else ""
         return {
             "name": name,
-            "price": float(price),
+            "price": price,
             "brand": "",
-            "image_url": image_url,
+            "image_url": img,
+            "comp_image_url": img,
             "comp_url": url,
             "sku": _stable_sku_from_url(url),
         }
+
+    def _hybrid_parse_html(self, html: str, url: str) -> Tuple[Optional[Dict[str, Any]], str, str]:
+        """استخراج هجين متعدد الطبقات → (صف، خطأ، طريقة)."""
+        try:
+            soup = BeautifulSoup(html, "html.parser")
+        except Exception as e:
+            return None, f"parse_exc:{type(e).__name__}", ""
+
+        r_ld = self._parse_json_ld_scripts(soup, url)
+        if r_ld and r_ld.get("name"):
+            try:
+                p0 = float(r_ld.get("price", 0) or 0)
+            except (TypeError, ValueError):
+                p0 = 0.0
+            if p0 > 0:
+                r_ld["extraction_method"] = "json_ld"
+                return r_ld, "", "json_ld"
+
+            partial_name = str(r_ld["name"]).strip()
+            partial_brand = str(r_ld.get("brand", "") or "")
+            partial_img = str(r_ld.get("image_url", "") or "")
+            sku_ld = str(r_ld.get("sku") or _stable_sku_from_url(url))
+
+            css_hit = self._extract_css_layers(soup, url)
+            if css_hit:
+                row, method = css_hit
+                row["name"] = row.get("name") or partial_name
+                row["brand"] = row.get("brand") or partial_brand
+                if partial_img and not (row.get("image_url") or "").strip():
+                    row["image_url"] = partial_img
+                    row["comp_image_url"] = partial_img
+                row["sku"] = sku_ld
+                row["extraction_method"] = f"json_ld+{method}"
+                return row, "", row["extraction_method"]
+
+            m_name, m_price, m_img = self._meta_extract_name_price_img(soup)
+            if m_price is not None and m_price > 0:
+                nm = partial_name or m_name
+                if nm:
+                    row = {
+                        "name": nm,
+                        "price": float(m_price),
+                        "brand": partial_brand,
+                        "image_url": (partial_img or m_img or ""),
+                        "comp_image_url": (partial_img or m_img or ""),
+                        "comp_url": url,
+                        "sku": sku_ld,
+                    }
+                    row["extraction_method"] = "json_ld+meta_og"
+                    return row, "", row["extraction_method"]
+
+            rx_row = self._extract_regex_layer(html, soup, url)
+            if rx_row:
+                rx_row["name"] = partial_name or rx_row["name"]
+                rx_row["brand"] = partial_brand or rx_row.get("brand", "")
+                if partial_img and not (rx_row.get("image_url") or "").strip():
+                    rx_row["image_url"] = partial_img
+                    rx_row["comp_image_url"] = partial_img
+                rx_row["sku"] = sku_ld
+                rx_row["extraction_method"] = "json_ld+regex_sar"
+                return rx_row, "", rx_row["extraction_method"]
+
+        m_name, m_price, m_img = self._meta_extract_name_price_img(soup)
+        if m_name and m_price is not None and m_price > 0:
+            row = {
+                "name": m_name,
+                "price": float(m_price),
+                "brand": "",
+                "image_url": m_img,
+                "comp_image_url": m_img,
+                "comp_url": url,
+                "sku": _stable_sku_from_url(url),
+            }
+            row["extraction_method"] = "meta_og"
+            return row, "", "meta_og"
+
+        css_hit = self._extract_css_layers(soup, url)
+        if css_hit:
+            row, method = css_hit
+            row["extraction_method"] = method
+            return row, "", method
+
+        rx_row = self._extract_regex_layer(html, soup, url)
+        if rx_row:
+            rx_row["extraction_method"] = "regex_sar"
+            return rx_row, "", "regex_sar"
+
+        if re.search(r"(captcha|cloudflare|access\.denied|حظر|robot)", html, re.I):
+            return None, "blocked_or_login_page", ""
+
+        return None, "parse_no_layer_matched", ""
 
     def _parse_json_ld_scripts(self, soup: BeautifulSoup, url: str) -> Optional[Dict[str, Any]]:
         scripts = soup.find_all("script", type="application/ld+json")
@@ -407,285 +1271,456 @@ class AsyncCompetitorScraper:
 
     async def fetch_and_parse_url(
         self, session: aiohttp.ClientSession, url: str
-    ) -> Optional[Dict[str, Any]]:
-        async with self.semaphore:
-            await asyncio.sleep(random.uniform(1.0, 3.0))
-            ref = self._referer_for_url(url)
-            try:
-                async with session.get(
-                    url,
-                    headers=self._get_headers(referer=ref),
-                    timeout=aiohttp.ClientTimeout(total=45),
-                ) as response:
-                    if response.status != 200:
-                        return None
-                    ctype = (response.headers.get("Content-Type") or "").lower()
-                    if "xml" in ctype and url.lower().endswith(".xml"):
-                        return None
-                    html_content = await response.text(errors="replace")
-            except Exception as e:
-                logger.error("Error scraping %s: %s", url, e)
-                return None
+    ) -> ScrapeAttempt:
+        max_tries = int(os.environ.get("SCRAPER_FETCH_RETRIES", "4"))
+        max_tries = max(1, min(max_tries, 7))
+        min_d = float(os.environ.get("SCRAPER_MIN_DELAY", "0.12"))
+        max_d = float(os.environ.get("SCRAPER_MAX_DELAY", "0.85"))
+        if max_d < min_d:
+            min_d, max_d = max_d, min_d
 
-        try:
-            soup = BeautifulSoup(html_content, "html.parser")
+        last_code = "unknown"
+        last_detail = ""
+        saw_soft_block = False
 
-            row = self._parse_json_ld_scripts(soup, url)
-            if row is not None:
-                return row
-
-            row = self._extract_meta_fallback(soup, url)
-            if row is not None:
-                return row
-
-            # Fallback خفيف: أنماط سعر في HTML الخام
-            for pat in (
-                r'"price"\s*:\s*"?([\d.,]+)"?',
-                r"product:price:amount\"\s+content=\"([\d.,]+)\"",
-            ):
-                mm = re.search(pat, html_content, re.I)
-                if mm:
-                    p = _parse_price_from_text(mm.group(1))
-                    if p is not None:
-                        tit = soup.find("meta", property="og:title")
-                        nm = (
-                            str(tit["content"]).strip()
-                            if tit and tit.get("content")
-                            else (str(soup.title.string).strip() if soup.title and soup.title.string else "")
-                        )
-                        if nm:
-                            og_img = soup.find("meta", property="og:image")
-                            image_url = (
-                                str(og_img["content"]).strip()
-                                if og_img and og_img.get("content")
-                                else ""
+        for attempt in range(max_tries):
+            html_content = ""
+            ua = _USER_AGENTS[(attempt + random.randint(0, len(_USER_AGENTS) - 1)) % len(_USER_AGENTS)]
+            async with self._backoff_lock:
+                extra_backoff = self._adaptive_extra_delay
+            async with self.semaphore:
+                delay = random.uniform(min_d, max_d) + extra_backoff
+                await asyncio.sleep(delay)
+                ref = self._referer_for_url(url)
+                try:
+                    async with session.get(
+                        url,
+                        headers=self._get_headers(referer=ref, user_agent=ua, url=url),
+                        timeout=aiohttp.ClientTimeout(total=55),
+                        allow_redirects=True,
+                    ) as response:
+                        st = response.status
+                        ctype = (response.headers.get("Content-Type") or "").lower()
+                        if "xml" in ctype and url.lower().endswith(".xml"):
+                            return ScrapeAttempt(
+                                False,
+                                error_code="wrong_content_xml",
+                                error_detail="url_points_to_xml",
                             )
-                            return {
-                                "name": nm,
-                                "price": float(p),
-                                "brand": "",
-                                "image_url": image_url,
-                                "comp_url": url,
-                                "sku": _stable_sku_from_url(url),
-                            }
-            return None
-        except Exception as e:
-            logger.error("Error parsing %s: %s", url, e)
-            return None
+                        if st in (403, 429, 502, 503):
+                            last_code = f"HTTP_{st}"
+                            last_detail = (response.reason or "retryable")[:120]
+                            async with self._backoff_lock:
+                                self._adaptive_extra_delay = min(
+                                    self._adaptive_extra_delay + 0.65, 16.0
+                                )
+                            await asyncio.sleep(1.1 + 0.7 * attempt)
+                            continue
+                        if st == 404:
+                            return ScrapeAttempt(
+                                False,
+                                error_code="HTTP_404",
+                                error_detail="الصفحة غير موجودة أو أُزيلت",
+                            )
+                        if st != 200:
+                            return ScrapeAttempt(
+                                False,
+                                error_code=f"HTTP_{st}",
+                                error_detail=(response.reason or "")[:200],
+                            )
+                        html_content = await response.text(errors="replace")
+                except asyncio.TimeoutError:
+                    last_code = "fetch_timeout"
+                    last_detail = f"محاولة {attempt + 1}/{max_tries}"
+                    async with self._backoff_lock:
+                        self._adaptive_extra_delay = min(self._adaptive_extra_delay + 0.35, 14.0)
+                    continue
+                except aiohttp.ClientError as e:
+                    last_code = f"fetch_{type(e).__name__}"
+                    last_detail = str(e)[:220]
+                    continue
+                except Exception as e:
+                    logger.error("Error scraping %s: %s", url, e)
+                    last_code = f"fetch_{type(e).__name__}"
+                    last_detail = str(e)[:220]
+                    continue
+
+            if not html_content or len(html_content.strip()) < 60:
+                last_code = "empty_or_tiny_html"
+                last_detail = f"طول={len(html_content or '')}"
+                continue
+
+            soft, sreason = self._classify_soft_block(html_content, 200)
+            if soft:
+                saw_soft_block = True
+                last_code = "soft_block"
+                last_detail = sreason
+                async with self._backoff_lock:
+                    self._adaptive_extra_delay = min(self._adaptive_extra_delay + 0.85, 18.0)
+                await asyncio.sleep(1.4 + 0.85 * attempt)
+                continue
+
+            row, perr, method = self._hybrid_parse_html(html_content, url)
+            if row is not None:
+                async with self._backoff_lock:
+                    self._adaptive_extra_delay = max(
+                        0.0, self._adaptive_extra_delay * 0.86 - 0.06
+                    )
+                ext = str(row.get("extraction_method") or method or "")
+                if saw_soft_block and (
+                    ext.startswith("css_")
+                    or "regex" in ext
+                    or ext.startswith("json_ld+")
+                    or ext == "meta_og"
+                ):
+                    try:
+                        from utils.live_price_store import append_activity_log
+
+                        host = urlparse(url).netloc[:100]
+                        append_activity_log(
+                            f"✅ تعافي استخراج بعد حظر/رد ضعيف: {host} — طبقة {ext}"
+                        )
+                    except Exception:
+                        pass
+                return ScrapeAttempt(True, row=row, extraction_method=ext)
+
+            last_code = perr or "parse_no_row"
+            last_detail = f"try {attempt + 1}/{max_tries}"
+            await asyncio.sleep(0.2 + 0.18 * attempt)
+
+        return ScrapeAttempt(False, error_code=last_code, error_detail=last_detail)
+
+
+async def _sync_sitemaps_once(
+    session: aiohttp.ClientSession, scraper: AsyncCompetitorScraper
+) -> List[Dict[str, Any]]:
+    competitors = _load_competitor_sitemaps()
+    diagnostics: List[Dict[str, Any]] = []
+    if not competitors:
+        diagnostics.append(
+            {
+                "competitor": "guard",
+                "domain": MAIN_STORE_DOMAIN,
+                "sitemap": None,
+                "urls_found": 0,
+                "urls_product_pages": 0,
+                "new_pending_added": 0,
+                "http_status": None,
+                "fetch_error": "no_competitors_or_main_store_filtered",
+                "parse_error": None,
+            }
+        )
+    for c in competitors:
+        comp_name = c.get("name", "")
+        domain = c.get("domain", "")
+        sitemap = await resolve_sitemap_url_async(domain)
+        if not sitemap:
+            diagnostics.append(
+                {
+                    "competitor": comp_name,
+                    "domain": domain,
+                    "sitemap": None,
+                    "urls_found": 0,
+                    "urls_product_pages": 0,
+                    "new_pending_added": 0,
+                    "http_status": None,
+                    "fetch_error": "sitemap_not_found",
+                    "parse_error": None,
+                }
+            )
+            continue
+        urls, diag = await scraper.scan_sitemap(session, sitemap)
+        raw_len = len(urls)
+        urls = _filter_salla_like_product_urls(urls)
+        inserted = _insert_discovered_urls(sitemap, urls)
+        diagnostics.append(
+            {
+                "competitor": comp_name,
+                "domain": domain,
+                "sitemap": sitemap,
+                "urls_found": raw_len,
+                "urls_product_pages": len(urls),
+                "new_pending_added": inserted,
+                "http_status": diag.get("http_status"),
+                "fetch_error": diag.get("fetch_error"),
+                "parse_error": diag.get("parse_error"),
+            }
+        )
+    return diagnostics
+
+
+async def _process_pending_batch(
+    session: aiohttp.ClientSession,
+    scraper: AsyncCompetitorScraper,
+    batch_size: int,
+) -> Dict[str, int]:
+    pending_urls = _load_pending_urls(batch_size)
+    if not pending_urls:
+        return {"queued": 0, "processed": 0, "updated_rows": 0, "failed": 0, "null": 0}
+
+    tasks = [scraper.fetch_and_parse_url(session, u) for u in pending_urls]
+    results = await asyncio.gather(*tasks, return_exceptions=True)
+
+    updated_rows = 0
+    batch_success = 0
+    failed = 0
+    parse_null = 0
+    fail_by_code: Dict[str, int] = {}
+    verbose_fail_log = os.environ.get("SCRAPER_LOG_EACH_FAILURE", "").strip() == "1"
+
+    def _bump_code(code: str) -> None:
+        fail_by_code[code] = fail_by_code.get(code, 0) + 1
+
+    for url, res in zip(pending_urls, results):
+        if isinstance(res, Exception):
+            err = f"{type(res).__name__}: {str(res)[:220]}"
+            push_scrape_failure(url, err)
+            _mark_url_status(url, "failed", err[:500])
+            failed += 1
+            _bump_code(type(res).__name__)
+            if verbose_fail_log:
+                try:
+                    from utils.live_price_store import append_activity_log
+
+                    append_activity_log(f"فشل كشط | {err[:160]} | {url[:100]}")
+                except Exception:
+                    pass
+            continue
+        if not isinstance(res, ScrapeAttempt):
+            msg = f"bad_result:{type(res).__name__}"
+            push_scrape_failure(url, msg)
+            _mark_url_status(url, "failed", msg)
+            parse_null += 1
+            _bump_code("bad_result")
+            continue
+        att: ScrapeAttempt = res
+        if att.ok and att.row:
+            row_db = dict(att.row)
+            ext_method = str(row_db.pop("extraction_method", "") or att.extraction_method or "")
+            if not str(row_db.get("comp_url", "") or "").strip():
+                row_db["comp_url"] = str(url).strip()
+            # ذاكرة حية فورية — قبل SQLite/CSV الدفعي (مع طريقة الاستخراج للتشخيص)
+            push_scraped_product(row_db, extraction_method=ext_method)
+            try:
+                from utils.db_manager import upsert_product as _upsert_product_db
+
+                _upsert_product_db(dict(row_db), extraction_method=ext_method)
+            except Exception:
+                logger.debug("db upsert_product skipped", exc_info=True)
+            try:
+                from utils.live_price_store import persist_scraped_product_snapshot
+
+                persist_scraped_product_snapshot(dict(row_db), extraction_method=ext_method)
+            except Exception:
+                logger.debug("persist_scraped_product_snapshot skipped", exc_info=True)
+            changed, _is_new = _upsert_product_and_get_change(row_db)
+            _mark_url_status(url, "completed", "")
+            batch_success += 1
+            if changed:
+                updated_rows += 1
+            continue
+
+        fm = att.failure_message() or "unknown"
+        push_scrape_failure(url, fm)
+        _mark_url_status(url, "failed", fm[:500])
+        parse_null += 1
+        _bump_code(att.error_code or "fail")
+        if verbose_fail_log:
+            try:
+                from utils.live_price_store import append_activity_log
+
+                append_activity_log(f"فشل كشط | {fm[:160]} | {url[:100]}")
+            except Exception:
+                pass
+
+    if fail_by_code and not verbose_fail_log and (failed + parse_null) > 0:
+        try:
+            from utils.live_price_store import append_activity_log
+
+            top = sorted(fail_by_code.items(), key=lambda x: -x[1])[:10]
+            summary = ", ".join(f"{k}={v}" for k, v in top)
+            append_activity_log(
+                f"📛 دفعة كشط: أخطاء {failed + parse_null} — {summary}"
+            )
+        except Exception:
+            pass
+
+    rows_in_csv = _export_competitors_csv_prioritized()
+    _merge_scraper_progress(
+        {"running": True, "rows_in_csv": rows_in_csv, **_progress_from_queue()}
+    )
+    _cleanup_state_queues()
+    # إعادة تشغيل خط التسعير عند أي نجاح في الدفعة حتى لا يبقى final_priced قديماً
+    # عند إعادة كشط بلا تغيير سعر (updated_rows=0). يُقيَّد التكرار داخل run_auto_pricing_pipeline_background.
+    pipeline_signal = updated_rows if updated_rows > 0 else (batch_success if batch_success > 0 else 0)
+    if pipeline_signal > 0:
+        await _trigger_ai_pipeline_async("batch_update", pipeline_signal)
+
+    return {
+        "queued": len(pending_urls),
+        "processed": len(pending_urls),
+        "updated_rows": updated_rows,
+        "failed": failed,
+        "null": parse_null,
+    }
 
 
 async def run_scraper_engine() -> None:
-    """المحرك الرئيسي الذي يشغل العملية بالكامل ويقرأ من JSON.
-    يحدّث `competitors_latest.csv` و `scraper_progress.json` بعد كل دفعة جلب."""
-    logger.info("Starting High-Speed Async Scraper Engine...")
-    t0 = time.perf_counter()
-    finished_at = datetime.now(timezone.utc).isoformat()
+    """Single full run:
+    - sync sitemap URLs to SQLite queue
+    - process all pending URLs (resume-safe)
+    - export prioritized CSV
+    - auto-trigger pricing pipeline for updated/new rows
+    """
+    _init_state_db()
+    started_t = time.perf_counter()
+    started_at = _utc_now()
 
-    competitors_file = "data/competitors_list.json"
-    competitor_sitemaps: List[str] = []
-
-    if os.path.exists(competitors_file):
-        try:
-            with open(competitors_file, "r", encoding="utf-8") as f:
-                competitor_sitemaps = json.load(f)
-        except Exception as e:
-            logger.error("Failed to load competitors JSON: %s", e)
-
-    if not competitor_sitemaps:
-        logger.info("No sitemaps found in config. Please add them via the UI. Exiting.")
-        _merge_scraper_progress(
-            {
-                "running": False,
-                "finished_at": finished_at,
-                "last_error": None,
-            }
-        )
-        _write_scraper_last_run_meta(
-            {
-                "status": "no_sitemaps",
-                "finished_at": finished_at,
-                "duration_seconds": round(time.perf_counter() - t0, 2),
-                "sitemaps_count": 0,
-                "urls_queued": 0,
-                "rows_extracted_before_dedupe": 0,
-                "rows_written_csv": 0,
-                "fetch_exceptions": 0,
-                "parse_null": 0,
-                "success_rate_pct": 0.0,
-                "sitemap_diagnostics": [],
-            }
-        )
-        return
-
-    scraper = AsyncCompetitorScraper(concurrency_limit=15)
-    all_results: List[Dict[str, Any]] = []
-    urls_queued = 0
-    urls_processed_total = 0
-    fetch_exceptions = 0
-    parse_null = 0
-    sitemap_diagnostics: List[Dict[str, Any]] = []
-    started = datetime.now(timezone.utc).isoformat()
     _merge_scraper_progress(
         {
             "running": True,
-            "started_at": started,
+            "started_at": started_at,
             "finished_at": None,
-            "urls_total": 0,
-            "urls_processed": 0,
+            "last_error": None,
             "rows_in_csv": 0,
             "current_sitemap": None,
-            "last_error": None,
+            "mode": "single_run",
+            **_progress_from_queue(),
         }
     )
 
+    scraper = AsyncCompetitorScraper(concurrency_limit=15)
+    diagnostics: List[Dict[str, Any]] = []
+    counters = {
+        "fetch_exceptions": 0,
+        "parse_null": 0,
+        "updated_rows": 0,
+        "processed_batches": 0,
+    }
+
     try:
         async with aiohttp.ClientSession() as session:
-            for sitemap in competitor_sitemaps:
-                urls, diag = await scraper.scan_sitemap(session, sitemap)
-                raw_len = len(urls)
-                urls = _filter_salla_like_product_urls(urls)
-                sitemap_diagnostics.append(
-                    {
-                        "sitemap": sitemap,
-                        "urls_found": raw_len,
-                        "urls_product_pages": len(urls),
-                        "http_status": diag.get("http_status"),
-                        "fetch_error": diag.get("fetch_error"),
-                        "parse_error": diag.get("parse_error"),
-                    }
-                )
-                if not urls:
-                    logger.warning(
-                        "No product-like URLs after filter (raw from sitemap: %s).",
-                        raw_len,
-                    )
-                    continue
+            diagnostics = await _sync_sitemaps_once(session, scraper)
+            _merge_scraper_progress({"running": True, **_progress_from_queue()})
 
-                max_urls_env = os.environ.get("SCRAPER_MAX_URLS", "").strip()
-                if max_urls_env:
-                    try:
-                        lim = int(max_urls_env)
-                        if lim > 0 and len(urls) > lim:
-                            logger.info(
-                                "SCRAPER_MAX_URLS=%s — limiting to %s URLs", lim, lim
-                            )
-                            urls = urls[:lim]
-                    except ValueError:
-                        pass
+            batch_size = int(os.environ.get("SCRAPER_PENDING_BATCH_SIZE", "200"))
+            batch_size = max(20, min(batch_size, 1000))
 
-                urls_queued += len(urls)
-                _merge_scraper_progress(
-                    {
-                        "current_sitemap": sitemap,
-                        "urls_total": urls_queued,
-                    }
-                )
-                logger.info(
-                    "Starting async fetch for %s products from %s...", len(urls), sitemap
-                )
-                tasks = [scraper.fetch_and_parse_url(session, url) for url in urls]
+            while True:
+                out = await _process_pending_batch(session, scraper, batch_size=batch_size)
+                if out["processed"] == 0:
+                    break
+                counters["processed_batches"] += 1
+                counters["fetch_exceptions"] += out["failed"]
+                counters["parse_null"] += out["null"]
+                counters["updated_rows"] += out["updated_rows"]
 
-                chunk_size = 400
-                for i in range(0, len(tasks), chunk_size):
-                    chunk_tasks = tasks[i : i + chunk_size]
-                    results = await asyncio.gather(*chunk_tasks, return_exceptions=True)
-
-                    for r in results:
-                        if isinstance(r, Exception):
-                            fetch_exceptions += 1
-                        elif r is None:
-                            parse_null += 1
-
-                    valid_results = [
-                        r for r in results if r is not None and not isinstance(r, Exception)
-                    ]
-                    all_results.extend(valid_results)
-                    urls_processed_total += len(chunk_tasks)
-
-                    rows_saved = _save_competitor_csv_rows(all_results)
-                    _merge_scraper_progress(
-                        {
-                            "running": True,
-                            "urls_total": urls_queued,
-                            "urls_processed": urls_processed_total,
-                            "rows_in_csv": rows_saved,
-                            "current_sitemap": sitemap,
-                        }
-                    )
-
-                logger.info("Finished processing %s.", sitemap)
-
-        duration = round(time.perf_counter() - t0, 2)
-        finished_at = datetime.now(timezone.utc).isoformat()
-        rows_before = len(all_results)
-        rows_written = (
-            len(pd.DataFrame(all_results).drop_duplicates(subset=["comp_url"]))
-            if all_results
-            else 0
-        )
-
-        if all_results:
-            logger.info(
-                "JOB DONE. Saved %s records to data/competitors_latest.csv securely.",
-                rows_written,
-            )
-            success_rate = (
-                round((rows_written / urls_queued) * 100, 2) if urls_queued else 0.0
-            )
-            _write_scraper_last_run_meta(
-                {
-                    "status": "ok",
-                    "finished_at": finished_at,
-                    "duration_seconds": duration,
-                    "sitemaps_count": len(competitor_sitemaps),
-                    "urls_queued": urls_queued,
-                    "rows_extracted_before_dedupe": rows_before,
-                    "rows_written_csv": rows_written,
-                    "fetch_exceptions": fetch_exceptions,
-                    "parse_null": parse_null,
-                    "success_rate_pct": success_rate,
-                    "sitemap_diagnostics": sitemap_diagnostics,
-                }
-            )
-        else:
-            _write_scraper_last_run_meta(
-                {
-                    "status": "empty",
-                    "finished_at": finished_at,
-                    "duration_seconds": duration,
-                    "sitemaps_count": len(competitor_sitemaps),
-                    "urls_queued": urls_queued,
-                    "rows_extracted_before_dedupe": 0,
-                    "rows_written_csv": 0,
-                    "fetch_exceptions": fetch_exceptions,
-                    "parse_null": parse_null,
-                    "success_rate_pct": 0.0,
-                    "sitemap_diagnostics": sitemap_diagnostics,
-                }
-            )
     except Exception as e:
-        logger.exception("Scraper engine failed: %s", e)
-        _merge_scraper_progress(
-            {
-                "last_error": str(e),
-            }
-        )
+        logger.exception("run_scraper_engine failed: %s", e)
+        _merge_scraper_progress({"last_error": str(e)})
         raise
     finally:
-        _rows_final = (
-            len(pd.DataFrame(all_results).drop_duplicates(subset=["comp_url"]))
-            if all_results
-            else 0
+        q = _get_queue_counters()
+        rows_in_csv = _export_competitors_csv_prioritized()
+        finished_at = _utc_now()
+        duration = round(time.perf_counter() - started_t, 2)
+        status = "ok" if rows_in_csv > 0 else "empty"
+        _write_scraper_last_run_meta(
+            {
+                "status": status,
+                "finished_at": finished_at,
+                "duration_seconds": duration,
+                "sitemaps_count": len(_load_competitor_sitemaps()),
+                "urls_queued": q.get("pending", 0) + q.get("completed", 0) + q.get("failed", 0),
+                "rows_extracted_before_dedupe": rows_in_csv,
+                "rows_written_csv": rows_in_csv,
+                "fetch_exceptions": counters["fetch_exceptions"],
+                "parse_null": counters["parse_null"],
+                "success_rate_pct": (
+                    round((q.get("completed", 0) / max(1, q.get("completed", 0) + q.get("failed", 0))) * 100, 2)
+                ),
+                "sitemap_diagnostics": diagnostics,
+            }
         )
         _merge_scraper_progress(
             {
                 "running": False,
-                "finished_at": datetime.now(timezone.utc).isoformat(),
-                "urls_total": urls_queued,
-                "urls_processed": urls_processed_total,
-                "rows_in_csv": _rows_final,
+                "finished_at": finished_at,
+                "rows_in_csv": rows_in_csv,
+                **_progress_from_queue(),
             }
         )
+
+
+async def run_continuous_scraper_service() -> None:
+    """Continuous, fault-tolerant scraper:
+    - sitemap sync every 2 hours
+    - keeps processing pending queue forever
+    """
+    _init_state_db()
+    scraper = AsyncCompetitorScraper(concurrency_limit=15)
+    sync_every_seconds = 2 * 60 * 60
+    poll_seconds = int(os.environ.get("SCRAPER_IDLE_POLL_SECONDS", "20"))
+    batch_size = int(os.environ.get("SCRAPER_PENDING_BATCH_SIZE", "200"))
+    batch_size = max(20, min(batch_size, 1000))
+    next_sync_at = 0.0
+
+    logger.info("Continuous scraper service started.")
+    _merge_scraper_progress({"running": True, "mode": "continuous"})
+
+    async with aiohttp.ClientSession() as session:
+        while True:
+            if os.path.exists(SCRAPER_STOP_FLAG_PATH):
+                _merge_scraper_progress(
+                    {
+                        "running": False,
+                        "mode": "stopped_by_flag",
+                        "last_error": "stopped_by_user_flag",
+                    }
+                )
+                break
+            now = time.time()
+            if now >= next_sync_at:
+                try:
+                    _merge_scraper_progress({"phase": "sync", "last_sync_started_at": _utc_now()})
+                    diagnostics = await _sync_sitemaps_once(session, scraper)
+                    q = _get_queue_counters()
+                    completed = q.get("completed", 0)
+                    failed = q.get("failed", 0)
+                    sr = (completed / max(1, completed + failed)) * 100.0
+                    _write_scraper_last_run_meta(
+                        {
+                            "status": "sync_only",
+                            "finished_at": _utc_now(),
+                            "duration_seconds": 0,
+                            "sitemaps_count": len(_load_competitor_sitemaps()),
+                            "urls_queued": _get_queue_counters().get("pending", 0),
+                            "rows_extracted_before_dedupe": 0,
+                            "rows_written_csv": _export_competitors_csv_prioritized(),
+                            "fetch_exceptions": 0,
+                            "parse_null": 0,
+                            "success_rate_pct": round(sr, 2),
+                            "sitemap_diagnostics": diagnostics,
+                        }
+                    )
+                    _merge_scraper_progress({"phase": "process", **_progress_from_queue()})
+                except Exception as e:
+                    logger.error("Periodic sitemap sync failed: %s", e)
+                    _merge_scraper_progress({"last_error": str(e)})
+                next_sync_at = now + sync_every_seconds
+
+            try:
+                out = await _process_pending_batch(session, scraper, batch_size=batch_size)
+                if out["processed"] == 0:
+                    await asyncio.sleep(max(5, poll_seconds))
+                else:
+                    _merge_scraper_progress(
+                        {"phase": "process", "running": True, **_progress_from_queue()}
+                    )
+            except Exception as e:
+                logger.exception("Batch processing failed, will continue: %s", e)
+                _merge_scraper_progress({"last_error": str(e)})
+                await asyncio.sleep(10)
 
 
 def main() -> None:
@@ -693,7 +1728,11 @@ def main() -> None:
         level=logging.INFO,
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
-    asyncio.run(run_scraper_engine())
+    # SCRAPER_CONTINUOUS=1 => service mode (sync each 2h + process pending forever)
+    if os.environ.get("SCRAPER_CONTINUOUS", "0").strip() == "1":
+        asyncio.run(run_continuous_scraper_service())
+    else:
+        asyncio.run(run_scraper_engine())
 
 
 if __name__ == "__main__":

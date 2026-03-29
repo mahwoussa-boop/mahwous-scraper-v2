@@ -1,169 +1,188 @@
 """
-تحويل رابط المتجر (مثل https://mahwous.com/) إلى رابط Sitemap صالح للكشط.
-يستخرج Sitemap من robots.txt ثم يجرّب مسارات شائعة (سلة/زد وغيرها).
+Dynamic sitemap resolver (async-first) for mixed ecommerce platforms.
+
+Supports:
+- direct sitemap URLs
+- robots.txt extraction
+- common fallback paths (Salla/Zid/Shopify/custom)
 """
 from __future__ import annotations
 
+import asyncio
 import re
-from typing import List, Optional, Tuple
-from urllib.parse import urlparse, urlunparse
+from typing import Dict, List, Optional, Tuple
+from urllib.parse import urljoin, urlparse, urlunparse
 
+import aiohttp
 import requests
 
-# مطابق تقريباً لرؤوس async_scraper لتقليل الحظر
-_BROWSER_HEADERS = {
+_HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
         "(KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
     ),
     "Accept": "application/xml,text/xml,application/xhtml+xml;q=0.9,*/*;q=0.8",
-    "Accept-Language": "ar-SA,ar;q=0.9,en-US;q=0.8",
+    "Accept-Language": "ar-SA,ar;q=0.9,en-US;q=0.8,en;q=0.7",
+    "Accept-Encoding": "gzip, deflate",
 }
 
+COMMON_SITEMAP_PATHS = [
+    "/sitemap.xml",
+    "/sitemap_index.xml",
+    "/sitemap_products.xml",
+    "/sitemap_products_1.xml",
+    "/sitemap-products.xml",
+    "/sitemap-products-1.xml",
+    "/product-sitemap.xml",
+    "/sitemap/sitemap-index.xml",
+    "/sitemap/sitemap.xml",
+]
 
-def _parse_origin(url: str) -> Optional[str]:
-    u = (url or "").strip()
-    if not u:
+
+def _parse_origin(url_or_domain: str) -> Optional[str]:
+    raw = (url_or_domain or "").strip()
+    if not raw:
         return None
-    if not u.lower().startswith(("http://", "https://")):
-        u = "https://" + u
-    p = urlparse(u)
+    if not raw.lower().startswith(("http://", "https://")):
+        raw = "https://" + raw
+    p = urlparse(raw)
     if not p.netloc:
         return None
     scheme = p.scheme if p.scheme in ("http", "https") else "https"
     return f"{scheme}://{p.netloc}"
 
 
-def _looks_like_direct_sitemap_url(url: str) -> bool:
-    p = urlparse(url.strip())
+def _looks_like_direct_sitemap_url(value: str) -> bool:
+    p = urlparse((value or "").strip())
     path = (p.path or "").lower()
-    return path.endswith(".xml") and ("sitemap" in path or "blog-" in path)
+    return path.endswith(".xml") and "sitemap" in path
 
 
-def _response_is_sitemap_xml(text: str) -> bool:
+def _is_sitemap_xml(text: str) -> bool:
     t = (text or "").lstrip()
     if not t:
         return False
-    if t.startswith("<?xml") or t.startswith("<"):
-        return bool(
-            re.search(r"<(?:urlset|sitemapindex)\b", t[:2000], re.I)
-        )
-    return False
+    if not (t.startswith("<") or t.startswith("<?xml")):
+        return False
+    return bool(re.search(r"<(?:urlset|sitemapindex)\b", t[:3000], re.I))
 
 
-def _probe_sitemap_url(url: str, timeout: float = 20.0) -> bool:
+async def _probe_url(session: aiohttp.ClientSession, url: str, timeout: float = 20.0) -> bool:
     try:
-        r = requests.get(
+        async with session.get(
             url,
-            headers=_BROWSER_HEADERS,
-            timeout=timeout,
+            headers=_HEADERS,
+            timeout=aiohttp.ClientTimeout(total=timeout),
             allow_redirects=True,
-        )
-        if r.status_code != 200:
-            return False
-        return _response_is_sitemap_xml(r.text)
-    except requests.RequestException:
+        ) as resp:
+            if resp.status != 200:
+                return False
+            body = await resp.text(errors="replace")
+            return _is_sitemap_xml(body)
+    except Exception:
         return False
 
 
-def _sitemap_urls_from_robots(origin: str, timeout: float = 15.0) -> List[str]:
-    robots_url = origin.rstrip("/") + "/robots.txt"
+async def _robots_sitemaps_async(session: aiohttp.ClientSession, origin: str) -> List[str]:
+    robots = origin.rstrip("/") + "/robots.txt"
     out: List[str] = []
     try:
-        r = requests.get(
-            robots_url,
-            headers=_BROWSER_HEADERS,
-            timeout=timeout,
+        async with session.get(
+            robots,
+            headers=_HEADERS,
+            timeout=aiohttp.ClientTimeout(total=15),
             allow_redirects=True,
-        )
-        if r.status_code != 200:
-            return []
-        for line in r.text.splitlines():
-            line = line.strip()
-            if not line or line.startswith("#"):
-                continue
-            low = line.lower()
-            if low.startswith("sitemap:"):
-                u = line.split(":", 1)[1].strip()
-                if u.startswith("http"):
-                    out.append(u)
-    except requests.RequestException:
-        pass
+        ) as resp:
+            if resp.status != 200:
+                return out
+            txt = await resp.text(errors="replace")
+    except Exception:
+        return out
+
+    for ln in txt.splitlines():
+        s = ln.strip()
+        if not s or s.startswith("#"):
+            continue
+        if s.lower().startswith("sitemap:"):
+            u = s.split(":", 1)[1].strip()
+            if u.startswith("http"):
+                out.append(u)
     return out
 
 
-def _fallback_candidates(origin: str) -> List[str]:
-    base = origin.rstrip("/")
-    return [
-        f"{base}/sitemap.xml",
-        f"{base}/sitemap_products.xml",
-        f"{base}/sitemap_index.xml",
-        f"{base}/sitemap-products.xml",
-    ]
+async def resolve_sitemap_url_async(domain_or_url: str) -> Optional[str]:
+    """
+    Takes a domain/store URL and returns the first valid sitemap URL using aiohttp.
+    """
+    origin = _parse_origin(domain_or_url)
+    if not origin:
+        return None
+
+    # If direct sitemap URL passed, test it first.
+    raw = (domain_or_url or "").strip()
+    direct_candidates: List[str] = []
+    if _looks_like_direct_sitemap_url(raw):
+        p = urlparse(raw if raw.startswith("http") else ("https://" + raw))
+        direct_candidates.append(
+            urlunparse((p.scheme, p.netloc, p.path.rstrip("/") or "/", "", "", ""))
+        )
+
+    async with aiohttp.ClientSession() as session:
+        for u in direct_candidates:
+            if await _probe_url(session, u):
+                return u
+
+        robots_urls = await _robots_sitemaps_async(session, origin)
+        preferred = sorted(
+            robots_urls,
+            key=lambda x: (0 if "product" in x.lower() else 1, x),
+        )
+        for u in preferred:
+            if await _probe_url(session, u):
+                return u
+
+        fallback_urls = [urljoin(origin.rstrip("/") + "/", p.lstrip("/")) for p in COMMON_SITEMAP_PATHS]
+        # probe concurrently for speed
+        checks = await asyncio.gather(*[_probe_url(session, u) for u in fallback_urls], return_exceptions=False)
+        for u, ok in zip(fallback_urls, checks):
+            if ok:
+                return u
+    return None
 
 
 def resolve_store_to_sitemap_url(user_input: str) -> Tuple[Optional[str], str]:
     """
-    يعيد (رابط الـ sitemap الجاهز للكشط، رسالة توضيحية للمستخدم).
-    إذا فشل كل شيء يعيد (None, سبب).
+    Backward-compatible sync wrapper used by UI forms.
     """
-    raw = (user_input or "").strip()
-    if not raw:
-        return None, "الرجاء إدخال رابط."
+    try:
+        found = asyncio.run(resolve_sitemap_url_async(user_input))
+    except RuntimeError:
+        # If called from an already-running loop, fallback sync probing.
+        found = None
 
-    # رابط مباشر لملف xml — تحقق أولاً
-    if not raw.lower().startswith(("http://", "https://")):
-        raw = "https://" + raw
-    p = urlparse(raw)
-    if not p.netloc:
-        return None, "تعذر قراءة نطاق الرابط."
+    if found:
+        return found, f"تم الاستنتاج تلقائياً: `{found}`"
+    return None, "لم يتم العثور على Sitemap صالح تلقائياً."
 
-    if _looks_like_direct_sitemap_url(raw):
-        candidate = urlunparse(
-            (p.scheme, p.netloc, p.path.rstrip("/") or "/", "", "", "")
-        )
-        if _probe_sitemap_url(candidate):
-            return candidate, f"تم اعتماد رابط الـ Sitemap مباشرة: `{candidate}`"
-        # رابط xml قديم/معطّل (مثل sitemap_products.xml → 410) — نكمل الاكتشاف من جذر الموقع
-        origin = _parse_origin(raw)
-        if not origin:
-            return (
-                None,
-                "الرابط ينتهي بـ .xml لكن الخادم لم يُرجع XML صالحاً.",
-            )
-    else:
-        origin = _parse_origin(raw)
+
+def resolve_sitemap_url_sync(domain_or_url: str) -> Optional[str]:
+    """
+    Sync fallback for contexts that cannot await.
+    """
+    origin = _parse_origin(domain_or_url)
     if not origin:
-        return None, "رابط المتجر غير صالح."
+        return None
+    candidates: List[str] = []
+    if _looks_like_direct_sitemap_url(domain_or_url):
+        p = urlparse(domain_or_url if domain_or_url.startswith("http") else ("https://" + domain_or_url))
+        candidates.append(urlunparse((p.scheme, p.netloc, p.path.rstrip("/") or "/", "", "", "")))
+    candidates.extend(urljoin(origin.rstrip("/") + "/", p.lstrip("/")) for p in COMMON_SITEMAP_PATHS)
 
-    # من robots.txt (الأولوية لما يعلنه الموقع — غالباً sitemap.xml)
-    from_robots = _sitemap_urls_from_robots(origin)
-    preferred: List[str] = []
-    rest: List[str] = []
-    for u in from_robots:
-        lu = u.lower()
-        if "product" in lu:
-            preferred.append(u)
-        else:
-            rest.append(u)
-    ordered = preferred + rest
-    for u in ordered:
-        if _probe_sitemap_url(u):
-            return u, f"تم الاستنتاج من robots.txt: `{u}`"
-
-    # مسارات شائعة على جذر المتجر
-    for u in _fallback_candidates(origin):
-        if _probe_sitemap_url(u):
-            return u, f"تم الاستنتاج تلقائياً: `{u}`"
-
-    hint = ""
-    if from_robots:
-        hint = f" وُجد في robots.txt: {', '.join(from_robots[:3])}"
-        if len(from_robots) > 3:
-            hint += "…"
-    return (
-        None,
-        "لم يُعثر على Sitemap يعمل (HTTP 200 وXML)."
-        + hint
-        + " جرّب فتح الرابط في المتصفح أو أضف رابط sitemap يدوياً من لوحة المتجر.",
-    )
+    for u in candidates:
+        try:
+            r = requests.get(u, headers=_HEADERS, timeout=15, allow_redirects=True)
+            if r.status_code == 200 and _is_sitemap_xml(r.text):
+                return u
+        except Exception:
+            continue
+    return None
