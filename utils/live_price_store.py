@@ -10,7 +10,6 @@ import threading
 import time
 from datetime import datetime, timezone
 from typing import Any, Callable, Dict, List, Optional
-
 import pandas as pd
 
 from utils.scrape_live_cards import bucket_final_priced_df, classify_pricing_row
@@ -55,10 +54,63 @@ def init_live_db() -> None:
                 message TEXT NOT NULL
             );
             CREATE INDEX IF NOT EXISTS idx_live_cards_bucket ON live_cards(bucket);
+            CREATE TABLE IF NOT EXISTS scraped_competitor_live (
+                comp_url TEXT PRIMARY KEY,
+                name TEXT,
+                price REAL,
+                brand TEXT,
+                image_url TEXT,
+                sku TEXT,
+                extraction_method TEXT,
+                updated_at TEXT NOT NULL
+            );
             """
         )
         conn.commit()
         conn.close()
+
+
+def persist_scraped_product_snapshot(row: Dict[str, Any], extraction_method: str = "") -> None:
+    """
+    يحفظ فوراً صف المنتج الظاهر في المخزن الحي في SQLite لوحة التسعير (مرآة دائمة لكل comp_url).
+    """
+    if not row:
+        return
+    comp_url = str(row.get("comp_url", "") or "").strip()
+    if not comp_url:
+        return
+    name = str(row.get("name", "") or "")
+    try:
+        price = float(row.get("price", 0) or 0)
+    except (TypeError, ValueError):
+        price = 0.0
+    brand = str(row.get("brand", "") or "")
+    image_url = str(row.get("image_url", "") or row.get("comp_image_url", "") or "")
+    sku = str(row.get("sku", "") or "")
+    ext = (extraction_method or str(row.get("Extraction_Method", "") or "")).strip()[:120]
+    now = _utc_iso()
+    init_live_db()
+    with _WRITE_LOCK:
+        conn = sqlite3.connect(LIVE_DB, timeout=45)
+        conn.execute("PRAGMA busy_timeout=45000;")
+        try:
+            conn.execute(
+                """INSERT INTO scraped_competitor_live
+                   (comp_url, name, price, brand, image_url, sku, extraction_method, updated_at)
+                   VALUES (?,?,?,?,?,?,?,?)
+                   ON CONFLICT(comp_url) DO UPDATE SET
+                   name=excluded.name,
+                   price=excluded.price,
+                   brand=excluded.brand,
+                   image_url=excluded.image_url,
+                   sku=excluded.sku,
+                   extraction_method=excluded.extraction_method,
+                   updated_at=excluded.updated_at""",
+                (comp_url, name, price, brand, image_url, sku, ext, now),
+            )
+            conn.commit()
+        finally:
+            conn.close()
 
 
 def append_activity_log(message: str) -> None:

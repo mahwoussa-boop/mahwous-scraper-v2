@@ -19,6 +19,39 @@ _AUTO_PIPELINE_LOCK = threading.Lock()
 _LAST_AUTO_PIPELINE_AT = 0.0
 
 
+def _merge_priced_with_previous(
+    priced_df: pd.DataFrame,
+    out_csv: str,
+    df_mine: pd.DataFrame,
+) -> pd.DataFrame:
+    """
+    يدمج نتيجة المطابقة الحالية مع صفوف سابقة في final_priced_latest.csv
+    لنفس skus الكتالوج التي لم تُعدَّ في الجولة الحالية (لا يُفقد صف بسبب تذبذب المطابقة).
+    """
+    if priced_df is None or priced_df.empty or "sku" not in priced_df.columns:
+        return priced_df
+    if not os.path.isfile(out_csv):
+        return priced_df
+    try:
+        old = pd.read_csv(out_csv, encoding="utf-8-sig")
+    except Exception:
+        return priced_df
+    if old is None or old.empty or "sku" not in old.columns:
+        return priced_df
+    mine = set(df_mine["sku"].fillna("").astype(str).str.strip())
+    new_skus = set(priced_df["sku"].fillna("").astype(str).str.strip())
+    osku = old["sku"].fillna("").astype(str).str.strip()
+    carry = old.loc[osku.isin(mine) & ~osku.isin(new_skus)].copy()
+    if carry.empty:
+        return priced_df
+    for c in priced_df.columns:
+        if c not in carry.columns:
+            carry[c] = pd.NA
+    carry = carry.reindex(columns=list(priced_df.columns), fill_value=pd.NA)
+    out = pd.concat([priced_df, carry], ignore_index=True, sort=False)
+    return out
+
+
 def _normalize_competitor_csv(df_comp: pd.DataFrame) -> pd.DataFrame:
     """يُوحّد أسماء الأعمدة بعد قراءة competitors_latest.csv من المكشطة."""
     import hashlib
@@ -350,6 +383,11 @@ def run_auto_pricing_pipeline_background(reason: str = "", changed_rows: int = 0
         if priced_df is None or priced_df.empty:
             return False
 
+        os.makedirs("data", exist_ok=True)
+        out_csv = "data/final_priced_latest.csv"
+        out_meta = "data/final_priced_latest_meta.json"
+        priced_df = _merge_priced_with_previous(priced_df, out_csv, df_mine)
+
         try:
             from utils.scrape_live_buffer import replace_pricing_preview
 
@@ -357,9 +395,6 @@ def run_auto_pricing_pipeline_background(reason: str = "", changed_rows: int = 0
         except Exception:
             pass
 
-        os.makedirs("data", exist_ok=True)
-        out_csv = "data/final_priced_latest.csv"
-        out_meta = "data/final_priced_latest_meta.json"
         priced_df.to_csv(out_csv, index=False, encoding="utf-8-sig")
         meta = {
             "status": "ok",

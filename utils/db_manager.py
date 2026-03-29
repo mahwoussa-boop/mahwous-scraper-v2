@@ -489,6 +489,20 @@ def init_db_v26(conn=None):
         notes TEXT
     )""")
 
+    # منتجات المنافس المكشوطة لحظياً (مرآة دائمة لـ product_state — مفتاح comp_url)
+    cur.execute("""CREATE TABLE IF NOT EXISTS scraped_competitor_products (
+        comp_url TEXT PRIMARY KEY,
+        name TEXT,
+        price REAL,
+        brand TEXT,
+        image_url TEXT,
+        sku TEXT,
+        competitor TEXT NOT NULL,
+        extraction_method TEXT,
+        first_seen TEXT,
+        last_seen TEXT NOT NULL
+    )""")
+
     c_conn.commit()
     if not conn:
         c_conn.close()
@@ -595,6 +609,63 @@ def upsert_comp_catalog(comp_dfs: dict):
     conn.commit()
     conn.close()
     return {"new_products": total_new}
+
+
+def upsert_scraped_competitor_product(row: dict, extraction_method: str = "") -> None:
+    """
+    يحفظ كل صف منتج منافس ناجح من الكاشط في SQLite الدائمة (DB_PATH).
+    المفتاح: comp_url — يُحدَّث عند كل كشط ناجح.
+    """
+    from urllib.parse import urlparse
+
+    if not row:
+        return
+    comp_url = str(row.get("comp_url", "") or "").strip()
+    if not comp_url:
+        return
+    host = (urlparse(comp_url).netloc or "").lower() or "unknown"
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    name = str(row.get("name", "") or "")
+    try:
+        price = float(row.get("price", 0) or 0)
+    except (TypeError, ValueError):
+        price = 0.0
+    brand = str(row.get("brand", "") or "")
+    image_url = str(row.get("image_url", "") or row.get("comp_image_url", "") or "")
+    sku = str(row.get("sku", "") or "")
+    ext = (extraction_method or str(row.get("Extraction_Method", "") or "")).strip()[:120]
+
+    try:
+        conn = get_db()
+        prev = conn.execute(
+            "SELECT comp_url FROM scraped_competitor_products WHERE comp_url=?",
+            (comp_url,),
+        ).fetchone()
+        if prev is None:
+            conn.execute(
+                """INSERT INTO scraped_competitor_products
+                   (comp_url, name, price, brand, image_url, sku, competitor,
+                    extraction_method, first_seen, last_seen)
+                   VALUES (?,?,?,?,?,?,?,?,?,?)""",
+                (comp_url, name, price, brand, image_url, sku, host, ext, now, now),
+            )
+        else:
+            conn.execute(
+                """UPDATE scraped_competitor_products SET
+                   name=?, price=?, brand=?, image_url=?, sku=?, competitor=?,
+                   extraction_method=?, last_seen=?
+                   WHERE comp_url=?""",
+                (name, price, brand, image_url, sku, host, ext, now, comp_url),
+            )
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        logger.debug("upsert_scraped_competitor_product skip: %s", e)
+
+
+def upsert_product(row: dict, extraction_method: str = "") -> None:
+    """واجهة موحّدة: حفظ منتج منافس مكشوط (JSON-LD / CSS / Regex) في القاعدة الدائمة."""
+    upsert_scraped_competitor_product(row, extraction_method=extraction_method)
 
 
 def save_processed(product_key: str, product_name: str, competitor: str,
@@ -711,6 +782,19 @@ def migrate_db_v26():
             cur.execute("ALTER TABLE processed_products ADD COLUMN auto_processed INTEGER DEFAULT 0")
         except Exception:
             pass
+
+        cur.execute("""CREATE TABLE IF NOT EXISTS scraped_competitor_products (
+            comp_url TEXT PRIMARY KEY,
+            name TEXT,
+            price REAL,
+            brand TEXT,
+            image_url TEXT,
+            sku TEXT,
+            competitor TEXT NOT NULL,
+            extraction_method TEXT,
+            first_seen TEXT,
+            last_seen TEXT NOT NULL
+        )""")
 
         conn.commit()
         conn.close()

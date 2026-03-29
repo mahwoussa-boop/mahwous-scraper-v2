@@ -1462,6 +1462,7 @@ async def _process_pending_batch(
     results = await asyncio.gather(*tasks, return_exceptions=True)
 
     updated_rows = 0
+    batch_success = 0
     failed = 0
     parse_null = 0
     fail_by_code: Dict[str, int] = {}
@@ -1496,10 +1497,25 @@ async def _process_pending_batch(
         if att.ok and att.row:
             row_db = dict(att.row)
             ext_method = str(row_db.pop("extraction_method", "") or att.extraction_method or "")
+            if not str(row_db.get("comp_url", "") or "").strip():
+                row_db["comp_url"] = str(url).strip()
             # ذاكرة حية فورية — قبل SQLite/CSV الدفعي (مع طريقة الاستخراج للتشخيص)
             push_scraped_product(row_db, extraction_method=ext_method)
+            try:
+                from utils.db_manager import upsert_product as _upsert_product_db
+
+                _upsert_product_db(dict(row_db), extraction_method=ext_method)
+            except Exception:
+                logger.debug("db upsert_product skipped", exc_info=True)
+            try:
+                from utils.live_price_store import persist_scraped_product_snapshot
+
+                persist_scraped_product_snapshot(dict(row_db), extraction_method=ext_method)
+            except Exception:
+                logger.debug("persist_scraped_product_snapshot skipped", exc_info=True)
             changed, _is_new = _upsert_product_and_get_change(row_db)
             _mark_url_status(url, "completed", "")
+            batch_success += 1
             if changed:
                 updated_rows += 1
             continue
@@ -1534,8 +1550,11 @@ async def _process_pending_batch(
         {"running": True, "rows_in_csv": rows_in_csv, **_progress_from_queue()}
     )
     _cleanup_state_queues()
-    if updated_rows > 0:
-        await _trigger_ai_pipeline_async("batch_update", updated_rows)
+    # إعادة تشغيل خط التسعير عند أي نجاح في الدفعة حتى لا يبقى final_priced قديماً
+    # عند إعادة كشط بلا تغيير سعر (updated_rows=0). يُقيَّد التكرار داخل run_auto_pricing_pipeline_background.
+    pipeline_signal = updated_rows if updated_rows > 0 else (batch_success if batch_success > 0 else 0)
+    if pipeline_signal > 0:
+        await _trigger_ai_pipeline_async("batch_update", pipeline_signal)
 
     return {
         "queued": len(pending_urls),
