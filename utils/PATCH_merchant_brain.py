@@ -14,7 +14,8 @@ import re
 import shutil
 from pathlib import Path
 
-BASE = Path(__file__).parent
+# الملف تحت utils/ — جذر المشروع مستوى واحد فوق
+BASE = Path(__file__).resolve().parent.parent
 
 FILES = {
     "pricing_pipeline": BASE / "utils" / "pricing_pipeline.py",

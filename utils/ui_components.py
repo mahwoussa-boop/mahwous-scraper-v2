@@ -333,7 +333,7 @@ def render_product_cards(df: pd.DataFrame, items_per_page: int = 15, key_prefix:
                 if st.button(
                     "✔️ تمت المزامنة" if already_sent else f"🚀 اعتماد السعر ({sug_price:,.2f})",
                     key=f"{key_prefix}_btn_{sku}_{index}_{i}",
-                    use_container_width=True,
+                    width="stretch",
                     disabled=already_sent,
                 ):
                     st.session_state["sent_to_make_keys"].add(row_key)
@@ -345,7 +345,7 @@ def render_product_cards(df: pd.DataFrame, items_per_page: int = 15, key_prefix:
         if st.button(
             "⬅️ الصفحة السابقة",
             disabled=(st.session_state[page_key] == 1),
-            use_container_width=True,
+            width="stretch",
             key=f"{key_prefix}_prev",
         ):
             st.session_state[page_key] -= 1
@@ -359,7 +359,7 @@ def render_product_cards(df: pd.DataFrame, items_per_page: int = 15, key_prefix:
         if st.button(
             "الصفحة التالية ➡️",
             disabled=(st.session_state[page_key] == total_pages),
-            use_container_width=True,
+            width="stretch",
             key=f"{key_prefix}_next",
         ):
             st.session_state[page_key] += 1

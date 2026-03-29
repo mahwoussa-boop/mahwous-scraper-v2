@@ -245,7 +245,7 @@ def render_decision_buttons(
 
     decision = None
     with col1:
-        if st.button("✅ موافق", key=f"approve_{key}", use_container_width=True):
+        if st.button("✅ موافق", key=f"approve_{key}", width="stretch"):
             save_price_decision(
                 sku=sku, product_name=product_name, our_price=our_price,
                 comp_price=comp_price, suggested=suggested, decision="approved",
@@ -255,7 +255,7 @@ def render_decision_buttons(
             decision = "approved"
 
     with col2:
-        if st.button("❌ رفض", key=f"reject_{key}", use_container_width=True):
+        if st.button("❌ رفض", key=f"reject_{key}", width="stretch"):
             save_price_decision(
                 sku=sku, product_name=product_name, our_price=our_price,
                 comp_price=comp_price, suggested=suggested, decision="rejected",
@@ -269,7 +269,7 @@ def render_decision_buttons(
             "سعر مخصص", min_value=0.0, value=float(suggested),
             step=0.5, key=f"custom_{key}", label_visibility="collapsed",
         )
-        if st.button("✏️ تعديل", key=f"modify_{key}", use_container_width=True):
+        if st.button("✏️ تعديل", key=f"modify_{key}", width="stretch"):
             save_price_decision(
                 sku=sku, product_name=product_name, our_price=our_price,
                 comp_price=comp_price, suggested=suggested, decision="modified",
