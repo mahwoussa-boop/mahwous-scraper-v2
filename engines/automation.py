@@ -18,13 +18,15 @@ import pandas as pd
 
 try:
     from config import (AUTOMATION_RULES_DEFAULT, AUTO_DECISION_CONFIDENCE,
-                        AUTO_PUSH_TO_MAKE, AUTO_SEARCH_INTERVAL_MINUTES, DB_PATH)
+                        AUTO_PUSH_TO_MAKE, AUTO_SEARCH_INTERVAL_MINUTES)
 except ImportError:
     AUTOMATION_RULES_DEFAULT = []
     AUTO_DECISION_CONFIDENCE = 92
     AUTO_PUSH_TO_MAKE = False
     AUTO_SEARCH_INTERVAL_MINUTES = 360
-    DB_PATH = "perfume_pricing.db"
+
+# مسار DB الموحّد — دائماً من db_manager
+from utils.db_manager import DB_PATH
 
 
 # ═══════════════════════════════════════════════════════
@@ -57,7 +59,13 @@ class PricingRule:
             if diff > min_diff:
                 new_price = comp_price - undercut
                 if cost_price > 0:
+                    # حماية مستندة إلى سعر التكلفة الفعلي
                     min_allowed = cost_price * (1 - max_loss_pct / 100)
+                    new_price = max(new_price, round(min_allowed, 2))
+                elif our_price > 0:
+                    # حماية افتراضية عند غياب سعر التكلفة:
+                    # لا تخفض أكثر من max_loss_pct% من سعرنا الحالي
+                    min_allowed = our_price * (1 - max_loss_pct / 100)
                     new_price = max(new_price, round(min_allowed, 2))
                 if new_price < 1:
                     return None
@@ -123,43 +131,20 @@ class AutomationEngine:
                 return decision
         return None
 
-    def evaluate_batch(self, products_df: pd.DataFrame,
-                        progress_callback=None) -> List[Dict]:
-        """
-        تقييم دفعة كاملة من المنتجات المؤكدة (مثلاً: 2461 منتج).
-        - progress_callback: دالة (processed, total) لشريط التقدم في Streamlit
-        - لا يُنتج قرارات لمنتجات نسبة تطابقها < 85% (حماية من الخسارة)
-        - يُسجّل كل قرار في automation_log تلقائياً
-        """
+    def evaluate_batch(self, products_df: pd.DataFrame) -> List[Dict]:
+        """تقييم دفعة من المنتجات"""
         decisions = []
-        total = len(products_df)
-        for idx, (_, row) in enumerate(products_df.iterrows()):
-            match_score = float(row.get("match_score", 0) or 0)
-            # ✅ حماية من القرارات الخاطئة
-            if match_score < 85:
-                if progress_callback:
-                    progress_callback(idx + 1, total)
-                continue
-
+        for _, row in products_df.iterrows():
             d = self.evaluate_product({
                 "name": str(row.get("المنتج", "")),
                 "our_price": float(row.get("السعر", 0) or 0),
                 "comp_price": float(row.get("سعر_المنافس", 0) or 0),
-                "match_score": match_score,
+                "match_score": float(row.get("نسبة_التطابق", 0) or 0),
                 "product_id": str(row.get("معرف_المنتج", "")),
                 "competitor": str(row.get("المنافس", "")),
-                "cost_price": float(row.get("سعر_التكلفة", 0) or 0),
             })
             if d:
                 decisions.append(d)
-                try:
-                    log_automation_decision(d, pushed=False)
-                except Exception:
-                    pass
-
-            if progress_callback:
-                progress_callback(idx + 1, total)
-
         return decisions
 
     def get_summary(self) -> Dict:
@@ -183,57 +168,6 @@ class AutomationEngine:
     def clear_log(self):
         with self._lock:
             self.decisions_log.clear()
-
-
-# ═══════════════════════════════════════════════════════
-#  1b. معالجة دفعة المنتجات المؤكدة (Confirmed Batch)
-# ═══════════════════════════════════════════════════════
-def process_confirmed_batch(products_df: pd.DataFrame,
-                             rules: list = None,
-                             push_to_make: bool = False,
-                             progress_callback=None) -> Dict:
-    """
-    معالجة دفعة المنتجات المؤكدة بالكامل (مثلاً: 2461 منتج).
-    1. يُطبّق قواعد التسعير على كل منتج
-    2. يُرسل القرارات المؤهلة إلى Make.com إذا push_to_make=True
-    3. يُعيد تقريراً شاملاً
-
-    مثال الاستخدام في app.py:
-        result = process_confirmed_batch(
-            confirmed_df,
-            push_to_make=AUTO_PUSH_TO_MAKE,
-            progress_callback=lambda p, t: progress_bar.progress(p/t)
-        )
-    """
-    try:
-        from config import AUTOMATION_RULES_DEFAULT, AUTO_DECISION_CONFIDENCE
-    except ImportError:
-        AUTOMATION_RULES_DEFAULT = []
-        AUTO_DECISION_CONFIDENCE = 95
-
-    engine = AutomationEngine(rules or AUTOMATION_RULES_DEFAULT)
-    decisions = engine.evaluate_batch(products_df, progress_callback=progress_callback)
-    summary = engine.get_summary()
-
-    pushed_count = 0
-    push_message = "الإرسال التلقائي غير مفعّل"
-
-    if push_to_make and decisions:
-        push_result = auto_push_decisions(decisions)
-        pushed_count = push_result.get("sent", 0)
-        push_message = push_result.get("message", "")
-
-    return {
-        "success": True,
-        "total_evaluated": len(products_df),
-        "decisions": decisions,
-        "summary": summary,
-        "pushed": pushed_count,
-        "push_message": push_message,
-        "decisions_lower": [d for d in decisions if d["action"] == "lower_price"],
-        "decisions_raise": [d for d in decisions if d["action"] == "raise_price"],
-        "decisions_keep":  [d for d in decisions if d["action"] == "keep_price"],
-    }
 
 
 # ═══════════════════════════════════════════════════════
@@ -273,21 +207,14 @@ def auto_push_decisions(decisions: List[Dict]) -> Dict:
         return {"success": False, "sent": 0, "message": f"فشل: {str(e)[:200]}"}
 
 
-def auto_process_review_items(review_df: pd.DataFrame,
-                               confidence_threshold: float = 95.0) -> pd.DataFrame:
-    """
-    معالجة تلقائية لقسم المراجعة بالتحقق المزدوج من AI.
-    - confidence_threshold: الحد الأدنى للثقة (95% افتراضياً ← لمنع أي خسارة)
-    - المنتجات التي لا تتجاوز 95% تبقى للمراجعة اليدوية
-    - يُسجّل سبب الرفض لكل منتج للشفافية الكاملة
-    """
+def auto_process_review_items(review_df: pd.DataFrame) -> pd.DataFrame:
+    """معالجة تلقائية لقسم المراجعة بالتحقق المزدوج من AI"""
     try:
         from engines.ai_engine import verify_match
     except ImportError:
         return pd.DataFrame()
 
     confirmed = []
-    rejected_count = 0
     for _, row in review_df.iterrows():
         our_name = str(row.get("المنتج", ""))
         comp_name = str(row.get("منتج_المنافس", ""))
@@ -297,144 +224,18 @@ def auto_process_review_items(review_df: pd.DataFrame,
             v = verify_match(our_name, comp_name,
                              float(row.get("السعر", 0) or 0),
                              float(row.get("سعر_المنافس", 0) or 0))
-            conf = float(v.get("confidence", 0))
-
-            # ✅ الشرط الصارم: match = True AND confidence >= 95%
-            if v.get("match") and conf >= confidence_threshold:
+            if v.get("match") and float(v.get("confidence", 0)) >= AUTO_DECISION_CONFIDENCE:
                 rd = row.to_dict() if hasattr(row, 'to_dict') else dict(row)
                 cs = v.get("correct_section", "")
                 if cs:
                     rd["القرار"] = cs
                 rd["_auto_verified"] = True
-                rd["_verification_confidence"] = conf
+                rd["_verification_confidence"] = v.get("confidence", 0)
                 confirmed.append(rd)
-            else:
-                # ❌ لم يتجاوز الحد → يبقى للمراجعة اليدوية
-                rejected_count += 1
         except Exception:
             continue
-
     return pd.DataFrame(confirmed) if confirmed else pd.DataFrame()
 
-
-
-# ═══════════════════════════════════════════════════════
-#  5. شبكة الأمان — Safety Net Alerts
-# ═══════════════════════════════════════════════════════
-
-SAFETY_MAX_DROP_PCT   = 30.0   # أقصى انخفاض مسموح تلقائياً (%)
-SAFETY_MAX_RAISE_PCT  = 50.0   # أقصى ارتفاع مسموح تلقائياً (%)
-SAFETY_ABS_MIN_PRICE  = 10.0   # أقل سعر مطلق مسموح (ريال)
-
-
-def safety_check_decisions(decisions: List[Dict]) -> Dict:
-    """
-    فحص شبكة الأمان على قائمة القرارات قبل إرسالها لـ Make.com.
-    يرفض أي قرار:
-    - انخفاض سعر > 30% دفعة واحدة (قد يكون خطأ بيانات عند المنافس)
-    - ارتفاع سعر > 50% دفعة واحدة
-    - السعر الجديد < 10 ريال
-
-    يُعيد:
-    {
-        "safe":    [قرارات مرّت الفحص],
-        "blocked": [قرارات مرفوضة مع السبب],
-        "summary": {total, safe_count, blocked_count}
-    }
-    """
-    safe    = []
-    blocked = []
-
-    for d in decisions:
-        old  = float(d.get("old_price", 0) or 0)
-        new  = float(d.get("new_price", 0) or 0)
-        action = d.get("action", "")
-
-        # تخطي قرارات الإبقاء
-        if action == "keep_price":
-            safe.append(d)
-            continue
-
-        # ── السعر الجديد أقل من الحد الأدنى المطلق ──
-        if new < SAFETY_ABS_MIN_PRICE and new > 0:
-            blocked.append({**d,
-                "_block_reason": f"السعر الجديد {new:.0f} ر.س أقل من الحد الأدنى {SAFETY_ABS_MIN_PRICE:.0f} ر.س"
-            })
-            continue
-
-        if old > 0 and new > 0:
-            change_pct = abs(new - old) / old * 100
-
-            # ── انخفاض مفرط ──
-            if action == "lower_price" and change_pct > SAFETY_MAX_DROP_PCT:
-                blocked.append({**d,
-                    "_block_reason": (
-                        f"انخفاض {change_pct:.1f}% > الحد الأقصى {SAFETY_MAX_DROP_PCT:.0f}% "
-                        f"({old:.0f} ← {new:.0f} ر.س) — قد يكون خطأ في بيانات المنافس"
-                    )
-                })
-                continue
-
-            # ── ارتفاع مفرط ──
-            if action == "raise_price" and change_pct > SAFETY_MAX_RAISE_PCT:
-                blocked.append({**d,
-                    "_block_reason": (
-                        f"ارتفاع {change_pct:.1f}% > الحد الأقصى {SAFETY_MAX_RAISE_PCT:.0f}% "
-                        f"({old:.0f} → {new:.0f} ر.س) — يحتاج موافقة يدوية"
-                    )
-                })
-                continue
-
-        safe.append(d)
-
-    return {
-        "safe":    safe,
-        "blocked": blocked,
-        "summary": {
-            "total":         len(decisions),
-            "safe_count":    len(safe),
-            "blocked_count": len(blocked),
-        }
-    }
-
-
-def safe_push_decisions(decisions: List[Dict]) -> Dict:
-    """
-    إرسال القرارات لـ Make.com بعد تمريرها على Safety Net أولاً.
-    القرارات المحظورة لا تُرسل وتُعاد في الرد للمراجعة اليدوية.
-    """
-    # ── 1. فحص الأمان ──
-    checked = safety_check_decisions(decisions)
-    safe_decisions    = checked["safe"]
-    blocked_decisions = checked["blocked"]
-
-    result = {
-        "success": False,
-        "sent": 0,
-        "blocked": len(blocked_decisions),
-        "blocked_details": blocked_decisions,
-        "message": "",
-    }
-
-    # ── 2. إرسال المؤهّلة ──
-    if safe_decisions:
-        push_result = auto_push_decisions(safe_decisions)
-        result["success"] = push_result.get("success", False)
-        result["sent"]    = push_result.get("sent", 0)
-        sent_msg = push_result.get("message", "")
-    else:
-        sent_msg = "لا توجد قرارات آمنة للإرسال"
-
-    # ── 3. بناء الرسالة ──
-    parts = [sent_msg]
-    if blocked_decisions:
-        parts.append(
-            f"⛔ {len(blocked_decisions)} قرار محجوب للمراجعة اليدوية "
-            f"(انخفاض/ارتفاع مفرط)"
-        )
-    result["message"] = " | ".join(parts)
-
-    return result
 
 # ═══════════════════════════════════════════════════════
 #  3. جدولة البحث الدوري
