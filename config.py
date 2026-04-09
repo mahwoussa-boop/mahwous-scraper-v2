@@ -1,37 +1,18 @@
 """
-config.py - الإعدادات المركزية v26.1
-المفاتيح محمية عبر Streamlit Secrets
-نظام تدوير المفاتيح الذكي (Key Rotation) لضمان استمرارية العمل
+config.py - الإعدادات المركزية v19.0
+المفاتيح: أولاً os.environ (Railway / Docker)، ثم Streamlit Secrets عند التوفر.
 """
 import json as _json
 import os as _os
 
+from utils.data_paths import get_data_db_path
+
 # ===== معلومات التطبيق =====
 APP_TITLE   = "نظام التسعير الذكي - مهووس"
 APP_NAME    = APP_TITLE
-APP_VERSION = "v26.1"
+APP_VERSION = "v26.0"
 APP_ICON    = "🧪"
-GEMINI_MODEL = "gemini-1.5-pro"     # تم التحديث لدقة مطابقة أعلى 99.9%
-
-# ══════════════════════════════════════════════
-#  Baseline Store (CRITICAL)
-# ══════════════════════════════════════════════
-MAIN_STORE_DOMAIN = "mahwous.com"
-MAIN_STORE_NAME = "Mahwous"
-TARGET_MARGIN = 0.35
-BASELINE_LOCKED = True
-
-
-def normalize_domain(value: str) -> str:
-    v = str(value or "").strip().lower()
-    v = v.replace("https://", "").replace("http://", "")
-    v = v.lstrip("www.")
-    v = v.split("/")[0]
-    return v
-
-
-def is_main_store_domain(value: str) -> bool:
-    return normalize_domain(value) == normalize_domain(MAIN_STORE_DOMAIN)
+GEMINI_MODEL = "gemini-2.0-flash"   # النموذج المستقر الموصى به
 
 # ══════════════════════════════════════════════
 #  قراءة Secrets بطريقة آمنة 100%
@@ -39,24 +20,21 @@ def is_main_store_domain(value: str) -> bool:
 # ══════════════════════════════════════════════
 def _s(key, default=""):
     """
-    يقرأ Secret بـ 3 طرق — آمن تماماً في مرحلة Build:
-    1. os.environ              Railway Environment Variables (يعمل في Build والتشغيل)
-    2. st.secrets[key]         Streamlit Cloud / محلي (.streamlit/secrets.toml)
-    3. default                 القيمة الافتراضية
+    يقرأ الإعداد بـ 3 طرق (بالترتيب):
+    1. os.environ              Railway / Docker / متغيرات النظام
+    2. st.secrets[key]         Streamlit Cloud عند وجود secrets.toml
+    3. default
     """
-    # 1. os.environ أولاً — يعمل في Build والتشغيل على Railway
+    # 1. البيئة أولاً — مطلوب على Railway حيث لا يوجد secrets.toml
     v = _os.environ.get(key, "")
     if v:
         return v
-    # 2. st.secrets — عند تشغيل streamlit run (لا نعتمد على runtime.exists()؛ أحياناً يكون False عند أول تحميل لـ config)
+    # 2. st.secrets (Streamlit Cloud فقط - يُستدعى عند التشغيل)
     try:
-        import sys
-        if "streamlit" in sys.modules:
-            import streamlit as _st
-            if hasattr(_st, "secrets"):
-                v = _st.secrets.get(key, None)
-                if v is not None:
-                    return str(v) if not isinstance(v, (list, dict)) else v
+        import streamlit as st
+        v = st.secrets[key]
+        if v is not None:
+            return str(v) if not isinstance(v, (list, dict)) else v
     except Exception:
         pass
     return default
@@ -100,134 +78,56 @@ def _parse_gemini_keys():
 
     # ─── المحاولة 3: مفاتيح منفصلة ───
     for n in ["GEMINI_KEY_1","GEMINI_KEY_2","GEMINI_KEY_3",
-              "GEMINI_KEY_4","GEMINI_KEY_5","GEMINI_KEY_6","GEMINI_KEY_7","GEMINI_KEY_8","GEMINI_KEY_9","GEMINI_KEY_10"]:
+              "GEMINI_KEY_4","GEMINI_KEY_5"]:
         k = _s(n, "")
         if k and k not in keys:
             keys.append(k)
-
-    # ─── المحاولة 4: أسماء شائعة الخطأ في Railway (مفتاح Google AI / Gemini) ───
-    if not keys:
-        for alias in ("GOOGLE_API_KEY", "GOOGLE_GENAI_API_KEY", "GENAI_API_KEY"):
-            k = _s(alias, "")
-            if k and isinstance(k, str) and k.strip() and k.strip() not in keys:
-                keys.append(k.strip())
-                break
 
     # تنظيف نهائي: إزالة المفاتيح الفارغة أو القصيرة
     keys = [k.strip() for k in keys if k and len(k) > 20]
     return keys
 
 
-def _parse_openrouter_keys():
-    """
-    يجمع مفاتيح OpenRouter من أي صيغة
-    """
-    keys = []
-    raw = _s("OPENROUTER_API_KEYS", "")
-    
-    if isinstance(raw, list):
-        keys = [k for k in raw if k and isinstance(k, str)]
-    elif raw and isinstance(raw, str):
-        raw = raw.strip()
-        if raw.startswith('['):
-            try:
-                parsed = _json.loads(raw)
-                if isinstance(parsed, list):
-                    keys = [k for k in parsed if k]
-            except Exception:
-                clean = raw.strip("[]").replace('"','').replace("'",'')  
-                keys = [k.strip() for k in clean.split(',') if k.strip()]
-        elif raw:
-            keys = [raw]
-    
-    single = _s("OPENROUTER_API_KEY", "")
-    if single and single not in keys:
-        keys.append(single)
-    
-    for n in ["OPENROUTER_KEY_1","OPENROUTER_KEY_2","OPENROUTER_KEY_3"]:
-        k = _s(n, "")
-        if k and k not in keys:
-            keys.append(k)
-    
-    keys = [k.strip() for k in keys if k and len(k) > 20]
-    return keys
-
-
-def _parse_cohere_keys():
-    """
-    يجمع مفاتيح Cohere من أي صيغة
-    """
-    keys = []
-    raw = _s("COHERE_API_KEYS", "")
-    
-    if isinstance(raw, list):
-        keys = [k for k in raw if k and isinstance(k, str)]
-    elif raw and isinstance(raw, str):
-        raw = raw.strip()
-        if raw.startswith('['):
-            try:
-                parsed = _json.loads(raw)
-                if isinstance(parsed, list):
-                    keys = [k for k in parsed if k]
-            except Exception:
-                clean = raw.strip("[]").replace('"','').replace("'",'')  
-                keys = [k.strip() for k in clean.split(',') if k.strip()]
-        elif raw:
-            keys = [raw]
-    
-    single = _s("COHERE_API_KEY", "")
-    if single and single not in keys:
-        keys.append(single)
-    
-    for n in ["COHERE_KEY_1","COHERE_KEY_2","COHERE_KEY_3"]:
-        k = _s(n, "")
-        if k and k not in keys:
-            keys.append(k)
-    
-    keys = [k.strip() for k in keys if k and len(k) > 20]
-    return keys
-
-
 # ══════════════════════════════════════════════
-#  المفاتيح الفعلية (قائمة واحدة مُحدَّثة in-place لتعمل مع from config import *)
+#  المفاتيح الفعلية
 # ══════════════════════════════════════════════
-GEMINI_API_KEYS = []
-GEMINI_API_KEYS.extend(_parse_gemini_keys())
-GEMINI_API_KEY = GEMINI_API_KEYS[0] if GEMINI_API_KEYS else ""
-
-
-def refresh_gemini_keys():
-    """إعادة قراءة المفاتيح من البيئة و Streamlit secrets بعد تهيئة التطبيق."""
-    global GEMINI_API_KEY
-    new_keys = _parse_gemini_keys()
-    GEMINI_API_KEYS.clear()
-    GEMINI_API_KEYS.extend(new_keys)
-    GEMINI_API_KEY = GEMINI_API_KEYS[0] if GEMINI_API_KEYS else ""
-OPENROUTER_API_KEYS = _parse_openrouter_keys()
-OPENROUTER_API_KEY = OPENROUTER_API_KEYS[0] if OPENROUTER_API_KEYS else ""
-COHERE_API_KEYS    = _parse_cohere_keys()
-COHERE_API_KEY     = COHERE_API_KEYS[0] if COHERE_API_KEYS else ""
+GEMINI_API_KEYS    = _parse_gemini_keys()
+GEMINI_API_KEY     = GEMINI_API_KEYS[0] if GEMINI_API_KEYS else ""
+OPENROUTER_API_KEY = _s("OPENROUTER_API_KEY") or _s("OPENROUTER_KEY") or ""
+COHERE_API_KEY     = _s("COHERE_API_KEY") or ""
 EXTRA_API_KEY      = _s("EXTRA_API_KEY")
 
-# ══════════════════════════════════════════════════
-#  إعدادات نظام تدوير المفاتيح (Key Rotation)
-# ══════════════════════════════════════════════════
-KEY_ROTATION_ENABLED = True  # تفعيل نظام تدوير المفاتيح
-KEY_ROTATION_ON_429 = True   # تبديل المفتاح تلقائياً عند خطأ 429 (Rate Limit)
-KEY_ROTATION_STRATEGY = "round_robin"  # استراتيجية: round_robin أو random
+
+def any_ai_provider_configured() -> bool:
+    """
+    True إذا وُجد مفتاح لأي مزود يدعمه المحرك (Gemini مباشرة، أو OpenRouter، أو Cohere).
+    على Railway يكفي OPENROUTER_API_KEY بدون GEMINI_* — المسارات تتدرج تلقائياً في ai_engine.
+    """
+    if GEMINI_API_KEYS:
+        return True
+    if (OPENROUTER_API_KEY or "").strip():
+        return True
+    if (COHERE_API_KEY or "").strip():
+        return True
+    return False
+
+
+ANY_AI_PROVIDER_CONFIGURED = any_ai_provider_configured()
 
 # ══════════════════════════════════════════════
-#  Make Webhooks
+#  Make Webhooks — يجب ضبطهما في متغيرات البيئة (Railway / .env)
+#  لا يوجد fallback إنتاجي — أي إرسال بدون URL سيُعيد خطأ صريحاً
 # ══════════════════════════════════════════════
-WEBHOOK_UPDATE_PRICES = (_s("WEBHOOK_UPDATE_PRICES") or "").strip()
-WEBHOOK_NEW_PRODUCTS = (_s("WEBHOOK_NEW_PRODUCTS") or "").strip()
+WEBHOOK_UPDATE_PRICES = _s("WEBHOOK_UPDATE_PRICES")
+WEBHOOK_NEW_PRODUCTS  = _s("WEBHOOK_NEW_PRODUCTS")
 
 # ══════════════════════════════════════════════
 #  ألوان
 # ══════════════════════════════════════════════
 COLORS = {
-    "raise": "#dc3545", "lower": "#ffc107", "approved": "#28a745",
-    "missing": "#007bff", "review": "#ff9800", "primary": "#6C63FF",
+    "raise": "#dc3545", "lower": "#00C853", "approved": "#28a745",
+    "missing": "#007bff", "review": "#ff9800", "excluded": "#9e9e9e",
+    "primary": "#6C63FF",
 }
 
 # ══════════════════════════════════════════════
@@ -269,9 +169,7 @@ KNOWN_BRANDS = [
     "Missoni","Juicy Couture","Moschino","Dunhill","Bentley","Jaguar",
     "Boucheron","Chopard","Elie Saab","Escada","Ferragamo","Fendi",
     "Kenzo","Lacoste","Loewe","Rochas","Roberto Cavalli","Tiffany",
-    "Van Cleef","Azzaro",    "Lanvin","لانفين","Gres","Grès","جريس",
-    "Cabotine","كابوتين",
-    "Banana Republic","Benetton","Bottega Veneta",
+    "Van Cleef","Azzaro","Banana Republic","Benetton","Bottega Veneta",
     "Celine","Dsquared2","Ed Hardy","Elizabeth Arden","Ermenegildo Zegna",
     "Swiss Arabian","Ard Al Zaafaran","Nabeel","Asdaaf","Maison Alhambra",
     "لطافة","العربية للعود","رصاصي","أجمل","الحرمين","أرماف",
@@ -328,27 +226,69 @@ AUTOMATION_RULES_DEFAULT = [
 # جدولة البحث الدوري (بالدقائق)
 AUTO_SEARCH_INTERVAL_MINUTES = 60 * 6   # كل 6 ساعات
 AUTO_PUSH_TO_MAKE = False               # إرسال تلقائي لـ Make.com (يتطلب تفعيل يدوي)
-AUTO_DECISION_CONFIDENCE = 95           # حد الثقة للقرار التلقائي (95% لمنع الخسائر)
+AUTO_DECISION_CONFIDENCE = 92           # حد الثقة للقرار التلقائي
 
 # ══════════════════════════════════════════════
 #  أقسام التطبيق (v26.0 — مع لوحة الأتمتة)
 # ══════════════════════════════════════════════
 SECTIONS = [
     "📊 لوحة التحكم",
-    "📂 رفع الملفات",
-    "🏢 كشط المنافسين",
     "🔴 سعر أعلى",
     "🟢 سعر أقل",
     "✅ موافق عليها",
-    "⚠️ تحت المراجعة",
     "🔍 منتجات مفقودة",
+    "⚠️ تحت المراجعة",
+    "⚪ مستبعد (لا يوجد تطابق)",
     "✔️ تمت المعالجة",
-    "🤖 الذكاء الصناعي",
+    "🔔 مركز التنبيهات",
+    "⡡ مركز المطابقة الذكي",
     "⚡ أتمتة Make",
     "🔄 الأتمتة الذكية",
+    "🕷️ كشط المنافسين",
     "⚙️ الإعدادات",
-    "📜 السجل",
 ]
 SIDEBAR_SECTIONS = SECTIONS
 PAGES_PER_TABLE  = 25
-DB_PATH          = "perfume_pricing.db"
+
+# ══════════════════════════════════════════════
+#  إعدادات المطابقة متعددة المراحل (Multi-Pass Matcher v1.0)
+# ══════════════════════════════════════════════
+
+# -- عتبات المرور الأول (Exact + RapidFuzz) --
+MATCH_PASS1_EXACT_THRESHOLD   = 100   # تطابق حرفي بعد التطبيع
+MATCH_PASS1_FUZZY_THRESHOLD   = 92    # token_sort_ratio ≥ 92 → تطابق مؤكد
+
+# -- عتبات المرور الثاني (Weighted Scoring) --
+MATCH_PASS2_CONFIRMED         = 85    # نقاط ≥ 85 → تطابق مؤكد (مقبول)
+MATCH_PASS2_REVIEW            = 68    # 68 ≤ نقاط < 85 → تحت المراجعة (gray zone)
+
+# -- عتبات المرور الثالث (TF-IDF Semantic) --
+MATCH_PASS3_COSINE_THRESHOLD  = 0.72  # تشابه cosine ≥ 0.72 → ترقية لمراجعة
+
+# -- عتبات المرور الرابع (AI Embeddings) --
+MATCH_PASS4_EMBED_CONFIRMED   = 0.88  # تشابه embedding ≥ 0.88 → تطابق مؤكد
+MATCH_PASS4_EMBED_REVIEW      = 0.75  # تشابه embedding ≥ 0.75 → مراجعة
+
+# -- أوزان الخصائص في نقاط المرور الثاني --
+MATCH_WEIGHTS = {
+    "name":    0.45,   # اسم المنتج
+    "brand":   0.25,   # الماركة
+    "size":    0.20,   # الحجم (ml / gm)
+    "type":    0.10,   # النوع (EDP/EDT/…)
+}
+
+# -- إعدادات Delta Detector (مراقبة تغيير الأسعار) --
+PRICE_ALERT_THRESHOLD_PCT  = 3.0   # % تغيير يستوجب التنبيه
+PRICE_ALERT_THRESHOLD_ABS  = 5.0   # ريال تغيير مطلق يستوجب التنبيه
+REVIEW_QUEUE_TTL_DAYS      = 7     # أيام قبل أرشفة تنبيه المراجعة تلقائياً
+
+# -- حالات المنتج (Product State Machine) --
+class ProductState:
+    PENDING      = "pending"        # قيد المعالجة
+    MATCHED      = "matched"        # تم تطابق مؤكد
+    REVIEW       = "review"         # تحت المراجعة (gray zone)
+    MISSING      = "missing"        # مفقود مؤكد (لا مطابق)
+    MIGRATED     = "migrated"       # تم الترحيل لسلة
+    PRICE_ALERT  = "price_alert"    # تنبيه تغيير سعر
+    ARCHIVED     = "archived"       # مؤرشف
+# DB_PATH محذوف — استخدم db_manager.DB_PATH الموحّد (pricing_v18.db)
