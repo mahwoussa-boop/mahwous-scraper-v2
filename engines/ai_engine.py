@@ -10,23 +10,11 @@ engines/ai_engine.py v26.0 — خبير مهووس الكامل
 ✅ تصنيف تلقائي لقسم "تحت المراجعة"
 ✅ v26.0: بحث أشمل في المتاجر السعودية مع تحليل JSON دقيق
 """
-import base64
-import hashlib
-import logging
 import requests, json, re, time, traceback
 from config import GEMINI_API_KEYS, OPENROUTER_API_KEY, COHERE_API_KEY
 
-_logger = logging.getLogger(__name__)
-
-# قائمة النماذج بالأولوية — يتدرج تلقائياً إذا كان النموذج غير متاح (404)
-_GEMINI_MODELS = [
-    "gemini-2.0-flash",
-    "gemini-1.5-flash",
-    "gemini-1.5-pro",
-]
-_GM  = _GEMINI_MODELS[0]  # النموذج الافتراضي (للعرض في التشخيص)
-_GU_TEMPLATE = "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
-_GU  = _GU_TEMPLATE.format(model=_GM)  # للتوافق مع الكود القديم
+_GM  = "gemini-2.0-flash"  # ← النموذج المستقر الموصى به
+_GU  = f"https://generativelanguage.googleapis.com/v1beta/models/{_GM}:generateContent"
 _OR  = "https://openrouter.ai/api/v1/chat/completions"
 _CO  = "https://api.cohere.ai/v1/generate"
 
@@ -247,17 +235,10 @@ PAGE_PROMPTS = {
 اجب بالعربية باحترافية وايجاز يمكنك استخدام markdown.""",
 "verify": MATCHING_FEW_SHOT_AR + """انت خبير تحقق من منتجات العطور دقيق جداً (متجر مهووس).
 
-قواعد المطابقة المنطقية (إلزامية — لا استثناء):
-- **match = false + confidence = 0** إذا اختلف أيٌّ مما يلي:
-  * الحجم (مل): 50ml ≠ 100ml حتى لو الاسم متطابق تماماً.
-  * التركيز: EDT ≠ EDP ≠ Parfum ≠ Extrait ≠ Elixir ≠ Body Mist ≠ Hair Mist.
-  * خط العطر: Sauvage ≠ Sauvage Elixir ≠ Sauvage Parfum.
-  * الماركة أو الجنس.
-  * وجود كلمات (بديل/مستوحى/tester/تستر) في أحدهما دون الآخر.
-- **match = false + confidence = 0** إذا كان الحجم موجوداً في أحدهما ومفقوداً في الآخر.
-- **قاعدة ذهبية:** إذا لم تجد تطابقاً دقيقاً 100% في الحجم والتركيز والماركة والخط، لا تُخمّن. أرجع confidence = 0 وصنّف المنتج كـ "مفقود". التخمين أسوأ من الإقرار بعدم التطابق.
-- **match = true** فقط عند: نفس الماركة + نفس الخط + نفس الحجم + نفس التركيز + الجنس متوافق.
-- الحد الأدنى لقبول المطابقة: confidence ≥ 85. أي مطابقة بأقل من 85% = "مفقود".
+قواعد المطابقة المنطقية (إلزامية):
+- **match = false** إذا اختلف أحدٌ مما يلي: الحجم (مل)، التركيز (EDP/EDT/Parfum/Elixir…)، خط العطر (مثل Sauvage vs Sauvage Elixir)، الجنس، أو الماركة — حتى لو تطابق الاسم ظاهرياً. عندها confidence منخفضة (مثلاً 0–25) والسبب يوضح اختلاف الحجم/التركيز.
+- **match = true** فقط عند تطابق الماركة + خط العطر + **نفس الحجم** + **نفس التركيز** + الجنس المناسب.
+- مثال صارم: 50 مل مقابل 100 مل → **match:false** (مطابقة 0% منطقياً).
 
 تحقق من: الماركة + اسم المنتج + الحجم (ml) + النوع (EDP/EDT/Parfum…) + الجنس.
 اجب JSON فقط بدون اي نص اضافي:
@@ -266,24 +247,13 @@ PAGE_PROMPTS = {
 اجب JSON فقط:
 {"market_price":0,"price_range":{"min":0,"max":0},"competitors":[{"name":"","price":0}],"recommendation":"","confidence":0}""",
 "reclassify": MATCHING_FEW_SHOT_AR + """انت نظام تصنيف دقيق لمنتجات العطور (متجر مهووس).
+«نفس المنتج» يعني **نفس SKU**: نفس الماركة + نفس خط العطر + نفس الحجم (مل) + نفس التركيز. إذا اختلف الحجم أو التركيز فليس «نفس المنتج» → صنّف كمفقود أو مراجعة لا كسعر أعلى/أقل.
 
-تعريف «نفس المنتج (SKU)»: نفس الماركة + نفس خط العطر + نفس الحجم (مل) + نفس التركيز.
-أي اختلاف في الحجم أو التركيز أو الخط → ليس نفس المنتج → صنّف كـ "مفقود".
-
-قواعد صارمة (لا استثناء):
-- إذا أحد المنتجَين يحتوي (بديل/مستوحى/tester/تستر) والآخر لا → "مفقود" (confidence = 0).
-- إذا الحجم موجود في أحدهما ومفقود في الآخر → "مفقود" (confidence = 0).
-- إذا الحجمان مختلفان (مثل 50ml vs 100ml) → "مفقود" (confidence = 0).
-- إذا التركيزان مختلفان (EDT ≠ EDP ≠ Parfum ≠ Extrait…) → "مفقود" (confidence = 0).
-- الحد الأدنى للقبول كـ "نفس المنتج": confidence ≥ 85. أقل من ذلك → "مفقود".
-- إذا لم تجد تطابقاً دقيقاً، لا تُخمّن — صنّف كـ "مفقود" مباشرة.
-
-الأقسام الصحيحة:
-- سعر اعلى: نفس المنتج (SKU) + سعرنا أعلى بأكثر من 10 ريال
-- سعر اقل: نفس المنتج (SKU) + سعرنا أقل بأكثر من 10 ريال
-- موافق:    نفس المنتج (SKU) + الفرق ≤ 10 ريال
-- مفقود:   أي اختلاف في SKU أو confidence < 85
-
+القسم الصحيح:
+- سعر اعلى: **نفس المنتج (SKU)** وسعرنا أعلى بأكثر من 10 ريال
+- سعر اقل: **نفس المنتج (SKU)** وسعرنا أقل بأكثر من 10 ريال
+- موافق: **نفس المنتج** + الفرق 10 ريال أو أقل + مطابقة منطقية صحيحة
+- مفقود: ليس نفس المنتج (مثلاً حجم أو تركيز مختلف) أو غير موجود لدينا
 يجب أن يطابق idx الرقم داخل [1]،[2]،... في قائمة المدخلات (واحد لكل سطر مرسل).
 اجب JSON فقط:
 {"results":[{"idx":1,"section":"القسم","confidence":85,"match":true,"reason":""},...]}"""
@@ -306,46 +276,37 @@ def _call_gemini(prompt, system="", grounding=False, temperature=0.3, max_tokens
     for i, key in enumerate(GEMINI_API_KEYS):
         if not key:
             continue
-        # يحاول كل نموذج بالتسلسل — يتخطى النموذج إذا كان غير متاح (404)
-        for model in _GEMINI_MODELS:
-            url = f"{_GU_TEMPLATE.format(model=model)}?key={key}"
-            try:
-                r = requests.post(url, json=payload, timeout=45)
-                if r.status_code == 200:
-                    data = r.json()
-                    if data.get("candidates"):
-                        parts = data["candidates"][0]["content"]["parts"]
-                        return "".join(p.get("text","") for p in parts)
-                    else:
-                        reason = data.get("promptFeedback",{}).get("blockReason","")
-                        _log_err("Gemini", f"مفتاح {i+1}/{model}: لا نتائج — {reason}")
-                    break  # نموذج يعمل لكن لا نتائج → لا فائدة من نماذج أخرى بنفس المفتاح
-                elif r.status_code == 429:
-                    _log_err("Gemini", f"مفتاح {i+1}/{model}: Rate Limit (429) — انتظار 2 ثانية")
-                    time.sleep(2)
-                    break  # نفس المفتاح محدود — انتقل للمفتاح التالي
-                elif r.status_code == 403:
-                    _log_err("Gemini", f"مفتاح {i+1}/{model}: IP محظور أو مفتاح غير مصرح (403)")
-                    break  # المفتاح معطوب — انتقل للتالي
-                elif r.status_code == 404:
-                    _log_err("Gemini", f"مفتاح {i+1}/{model}: نموذج غير متاح (404) — جرب {model}")
-                    continue  # جرب النموذج التالي في القائمة
+        try:
+            r = requests.post(f"{_GU}?key={key}", json=payload, timeout=45)
+            if r.status_code == 200:
+                data = r.json()
+                if data.get("candidates"):
+                    parts = data["candidates"][0]["content"]["parts"]
+                    return "".join(p.get("text","") for p in parts)
                 else:
-                    try:
-                        msg = r.json().get("error",{}).get("message","")
-                    except Exception:
-                        msg = r.text[:100]
-                    _log_err("Gemini", f"مفتاح {i+1}/{model}: {r.status_code} — {msg[:80]}")
-                    break
-            except requests.exceptions.ConnectionError as e:
-                _log_err("Gemini", f"مفتاح {i+1}: لا اتصال — {str(e)[:80]}")
-                break
-            except requests.exceptions.Timeout:
-                _log_err("Gemini", f"مفتاح {i+1}/{model}: Timeout (45s)")
-                break
-            except Exception as e:
-                _log_err("Gemini", f"مفتاح {i+1}/{model}: {str(e)[:80]}")
-                break
+                    # blocked / safety filter
+                    reason = data.get("promptFeedback",{}).get("blockReason","")
+                    _log_err("Gemini", f"مفتاح {i+1}: لا نتائج — {reason}")
+            elif r.status_code == 429:
+                _log_err("Gemini", f"مفتاح {i+1}: Rate Limit (429) — انتظار 2 ثانية")
+                time.sleep(2)  # ← 2 ثانية للـ 429
+                continue
+            elif r.status_code == 403:
+                _log_err("Gemini", f"مفتاح {i+1}: IP محظور أو مفتاح غير مصرح (403)")
+            elif r.status_code == 404:
+                _log_err("Gemini", f"مفتاح {i+1}: نموذج غير متاح {_GM} (404)")
+            else:
+                try:
+                    msg = r.json().get("error",{}).get("message","")
+                except Exception:
+                    msg = r.text[:100]
+                _log_err("Gemini", f"مفتاح {i+1}: {r.status_code} — {msg[:80]}")
+        except requests.exceptions.ConnectionError as e:
+            _log_err("Gemini", f"مفتاح {i+1}: لا اتصال — {str(e)[:80]}")
+        except requests.exceptions.Timeout:
+            _log_err("Gemini", f"مفتاح {i+1}: Timeout (45s)")
+        except Exception as e:
+            _log_err("Gemini", f"مفتاح {i+1}: {str(e)[:80]}")
     return None
 
 def _call_openrouter(prompt, system=""):
@@ -462,10 +423,7 @@ def _parse_json(txt):
         s = clean.find('{'); e = clean.rfind('}')+1
         if s >= 0 and e > s:
             return json.loads(clean[s:e])
-    except json.JSONDecodeError as _e:
-        _logger.debug("_parse_json: JSONDecodeError — %s | نص[:200]=%s", _e, txt[:200])
-    except Exception as _e:
-        _logger.debug("_parse_json: خطأ غير متوقع — %s", _e)
+    except: pass
     return None
 
 def _search_ddg(query, num_results=5):
@@ -651,29 +609,75 @@ def fetch_fragrantica_info(product_name):
 
 
 # ══ هوية مهووس + سلة — وصف شاعري سعودي (Gemini) ═══════════════════════════
-MAHWOUS_SALLA_PROMPT = """أنت الآن خبير عطور سعودي محترف تعمل في متجر (مهووس - Mahwous).
-أسلوبك: شاعري، واثق، دقيق تقنياً، ومقنع تسويقياً. لغتك العربية فصيحة بلمسة خليجية راقية.
-المهمة: توليد وصف تفصيلي لمنتج عطر مفقود متوافق مع معايير SEO ومنصة سلة.
+MAHWOUS_SALLA_PROMPT = """أنت خبير آلي متخصص في كتابة أوصاف منتجات العطور لمتجر "مهووس" (Mahwous) محسّنة لـ SEO ومحركات بحث الذكاء الاصطناعي (GEO).
 
-الهيكل الإلزامي للوصف (بالترتيب):
-1. العنوان الجذاب: [اسم العطر] + [الماركة] + [الحجم] + (التركيز).
-2. المقدمة الشاعرية: وصف حسي يلامس المشاعر (مثال: رحلة تأخذك إلى غابات الأرز...).
-3. الهرم العطري: (المقدمة، القلب، القاعدة) مع وصف المكونات الحقيقية فقط إن وُجدت في المدخلات.
-4. لماذا تختار هذا العطر؟: 4 نقاط قوة (الثبات، الفوحان، التميز، القيمة).
-5. متى وأين ترتديه؟: الفصول (صيف/شتاء)، الأوقات (صباح/مساء)، والمناسبات.
-6. لمسة خبير من مهووس: تقييم الفوحان (1-10)، الثبات (1-10)، ونصيحة رش احترافية.
-7. الأسئلة الشائعة: (3-5 أسئلة تهم العميل السعودي).
+## هويتك
+- خبير عطور محترف بخبرة 15+ سنة في العطور الفاخرة
+- متخصص في SEO و Generative Engine Optimization
+- كاتب محتوى عربي بأسلوب راقٍ، ودود، عاطفي، تسويقي مقنع
+- صوت متجر "مهووس" الوجهة الأولى للعطور الفاخرة في السعودية
 
-في نهاية الوصف، أضف بيانات SEO بصيغة JSON فقط (بدون markdown fence إن أمكن) كالتالي:
+## قواعد صارمة
+- لا إيموجي إطلاقاً
+- لا تخترع مكونات لم تُذكر — استخدم فقط ما وُرد في المدخلات أو "غير متوفر"
+- الطول الإجمالي: 800-1500 كلمة
+- أكد الأصالة "أصلي 100%" مرة واحدة على الأقل
+- أسلوب مزيج: راقٍ (40%) + ودود (25%) + عاطفي (20%) + تسويقي (15%)
+
+## الهيكل الإلزامي للمخرج (بالترتيب الحرفي)
+
+**السطر الأول (إلزامي):** الاسم الكامل بالإنجليزية
+مثال: Gres Cabotine Gold Eau de Toilette 100ml for Women
+
+**المقدمة الإبداعية (100-150 كلمة):**
+جملة افتتاحية عاطفية قوية تدمج اسم العطر بالعربي والإنجليزي، سنة الإصدار، اسم العطار إن وُجد. تنتهي بحث العميل على الشراء من مهووس.
+
+**تفاصيل المنتج**
+* الماركة الفاخرة: [اسم الماركة]
+* اسم العطر: [اسم العطر]
+* المصمم: [اسم العطار أو "غير متوفر"]
+* الجنس: [للنساء / للرجال / للجنسين]
+* العائلة العطرية: [العائلة أو "غير متوفر"]
+* الحجم: [الحجم مل]
+* التركيز: [EDP / EDT / إلخ بالعربية]
+* سنة الإصدار: [السنة أو "غير متوفر"]
+
+**رحلة العطر: اكتشف الهرم العطري الفاخر**
+* النفحات العليا (Top Notes): [المكونات + وصف حسي]
+* النفحات الوسطى (Heart Notes): [المكونات + وصف حسي]
+* النفحات الأساسية (Base Notes): [المكونات + وصف حسي + معلومة ثبات]
+
+**لماذا تختار/تختارين هذا العطر؟**
+* [نقطة الرائحة والتميز]
+* [نقطة الشعور والانطباع]
+* [نقطة الثبات والفوحان بأرقام: مثلاً 6-8 ساعات]
+* [نقطة أوقات الاستخدام المثالية]
+
+**لمسة خبير من مهووس: تقييمنا الاحترافي**
+فقرة نقدية احترافية تبدأ بـ "بعد تجربتنا المعمقة لعطر [الاسم]..."
+تتضمن: تقييم الفوحان (x/10)، الثبات (x/10)، مقارنة بعطر مشابه، نصيحة رش على نقاط النبض.
+
+**الأسئلة الشائعة حول العطر**
+* سؤال 1 + إجابة (50-80 كلمة)
+* سؤال 2 + إجابة
+* سؤال 3 + إجابة
+(6-8 أسئلة إلزامية تشمل: الاستخدام اليومي، الثبات، الفصل المناسب، المناسبات الرسمية)
+
+**اكتشف المزيد من مهووس**
+* [رابط بناءً على التصنيف]
+* [رابط بناءً على الماركة]
+* [رابط للتستر أو البدائل]
+عالمك العطري يبدأ من مهووس!
+
+---
+في نهاية الوصف، أضف بيانات SEO بصيغة JSON دقيقة (بدون أي نص بعدها):
 {
-  "page_title": "...",
-  "meta_description": "...",
-  "url_slug": "...",
-  "alt_text": "...",
-  "tags": "..."
-}
-
-قواعد صارمة: أكد أن العطر "أصلي 100%"، لا تخترع مكونات، خاطب الذوق الخليجي، لا تكرر نصاً فارغاً."""
+  "page_title": "[عنوان جذاب ≤60 حرف يحتوي الكلمة المفتاحية]",
+  "meta_description": "[وصف ≤155 حرف يذكر الماركة والمكونات وأصلي 100% من مهووس]",
+  "url_slug": "[brand-perfume-concentration-size-gender-mahwous]",
+  "alt_text": "[وصف دقيق لصورة زجاجة العطر]",
+  "tags": "[10 كلمات مفتاحية مفصولة بفواصل: الماركة، الاسم، المكونات، عطور مهووس]"
+}"""
 
 
 def _parse_seo_json_block(text: str):
@@ -734,9 +738,14 @@ def generate_mahwous_description(product_name, price, fragrantica_data=None, ext
     """
     frag_info = ""
     if fragrantica_data and fragrantica_data.get("success"):
-        top = ", ".join(fragrantica_data.get("top_notes", [])[:5])
-        mid = ", ".join(fragrantica_data.get("middle_notes", [])[:5])
-        base = ", ".join(fragrantica_data.get("base_notes", [])[:5])
+        def _to_list(v):
+            """يحوّل أي قيمة (str/list/None) إلى list بأمان."""
+            if isinstance(v, list):   return v
+            if isinstance(v, str):    return [x.strip() for x in v.split(",") if x.strip()]
+            return []
+        top  = ", ".join(_to_list(fragrantica_data.get("top_notes",    []))[:5])
+        mid  = ", ".join(_to_list(fragrantica_data.get("middle_notes", []))[:5])
+        base = ", ".join(_to_list(fragrantica_data.get("base_notes",   []))[:5])
         desc = fragrantica_data.get("description_ar", "")
         brand = fragrantica_data.get("brand", "")
         ptype = fragrantica_data.get("type", "")
@@ -798,261 +807,7 @@ def generate_mahwous_description(product_name, price, fragrantica_data=None, ext
     return body if body else txt
 
 # ══ تحقق منتج + تحديد القسم الصحيح ════════════════════════════════════════
-# ══════════════════════════════════════════════════════════════════════════════
-#  verify_perfume_match — طبقة تحقق Python صارمة (لا تعتمد على AI)
-#  تُطبَّق قبل كل استدعاء AI وبعده — تمنع المطابقات الكارثية (EDT vs Parfum)
-# ══════════════════════════════════════════════════════════════════════════════
-
-# ── استخراج الحجم ────────────────────────────────────────────────────────────
-_VM_SIZE_RE = re.compile(
-    r'(\d+(?:\.\d+)?)\s*(?:ml|مل|ML|Ml|cl|fl\.?\s*oz)',
-    re.I | re.UNICODE,
-)
-
-# ── استخراج التركيز (مُرتَّب من الأقوى إلى الأضعف) ──────────────────────────
-# ⚠️  الترتيب مهم: EDP قبل PARFUM حتى لا تخطف "بارفيوم" وحدها من "أو دو بارفيوم"
-_VM_CONC_PATTERNS = [
-    # EXTRAIT — الأقوى
-    (re.compile(
-        r'\b(?:extrait\s+de\s+parfum|extrait|اكستريه|اكسترايت|اكسترا\s+دو\s+بارفيوم)\b',
-        re.I | re.UNICODE), "EXTRAIT"),
-
-    # EDP — Eau de Parfum (يجب أن يأتي قبل PARFUM)
-    (re.compile(
-        r'\beau\s+de\s+parfum\b'
-        r'|\be\.?d\.?p\b'
-        r'|أو\s+دو\s+بارفيوم|او\s+دو\s+بارفيوم'
-        r'|\bأو\s+بارفيوم\b|\bاو\s+بارفيوم\b',
-        re.I | re.UNICODE), "EDP"),
-
-    # EDT — Eau de Toilette
-    (re.compile(
-        r'\beau\s+de\s+toilette\b'
-        r'|\be\.?d\.?t\b'
-        r'|أو\s+دو\s+تواليت|او\s+دو\s+تواليت'
-        r'|\bتواليت\b',
-        re.I | re.UNICODE), "EDT"),
-
-    # EDC — Eau de Cologne
-    (re.compile(
-        r'\beau\s+de\s+cologne\b'
-        r'|\be\.?d\.?c\b'
-        r'|أو\s+دو\s+كولون|او\s+دو\s+كولون'
-        r'|\bكولون\b(?!\s+إنتنس)|\bcologne\b',
-        re.I | re.UNICODE), "EDC"),
-
-    # PARFUM وحده — يأتي بعد EDP حتى لا يستأثر بـ "أو دو بارفيوم"
-    (re.compile(
-        r'(?<!\bde\s)(?<!\bدو\s)(?<!\bدو\s)\bparfum\b'
-        r'|\bبارفيوم\b(?!\s+كولون)(?!\s+او)(?!\s+أو)'
-        r'|\bبارفيوم\s+(?!كولون|او|أو)'
-        r'|\bبارفان\b',
-        re.I | re.UNICODE), "PARFUM"),
-
-    # ELIXIR — خط منتج (ليس مجرد تركيز)
-    (re.compile(
-        r'\belixir\b|اليكسير|الكسير',
-        re.I | re.UNICODE), "ELIXIR"),
-
-    # BODY MIST / SPRAY — تختلف اختلافاً جوهرياً عن العطر
-    (re.compile(
-        r'\bbody\s*mist\b|\bbody\s*spray\b|\bbody\s*lotion\b'
-        r'|بادي\s*ميست|بادي\s*سبراي|بودي\s*ميست',
-        re.I | re.UNICODE), "BODY_MIST"),
-
-    # HAIR MIST / SPRAY
-    (re.compile(
-        r'\bhair\s*mist\b|\bhair\s*spray\b|\bhair\s*perfume\b'
-        r'|هير\s*ميست|هير\s*سبراي',
-        re.I | re.UNICODE), "HAIR_MIST"),
-]
-
-# أزواج التركيز غير المتوافقة — أي منها → رفض صارم (0% match)
-_VM_INCOMPATIBLE: frozenset = frozenset([
-    frozenset(["EDP",     "EDT"]),
-    frozenset(["EDP",     "EDC"]),
-    frozenset(["EDP",     "PARFUM"]),
-    frozenset(["EDT",     "PARFUM"]),
-    frozenset(["EDT",     "EDC"]),
-    frozenset(["EXTRAIT", "EDP"]),
-    frozenset(["EXTRAIT", "EDT"]),
-    frozenset(["EXTRAIT", "EDC"]),
-    frozenset(["EXTRAIT", "PARFUM"]),
-    frozenset(["ELIXIR",  "EDP"]),
-    frozenset(["ELIXIR",  "EDT"]),
-    frozenset(["ELIXIR",  "PARFUM"]),
-    frozenset(["BODY_MIST", "EDP"]),
-    frozenset(["BODY_MIST", "EDT"]),
-    frozenset(["BODY_MIST", "PARFUM"]),
-    frozenset(["BODY_MIST", "EXTRAIT"]),
-    frozenset(["HAIR_MIST", "EDP"]),
-    frozenset(["HAIR_MIST", "EDT"]),
-    frozenset(["HAIR_MIST", "PARFUM"]),
-    frozenset(["HAIR_MIST", "EXTRAIT"]),
-])
-
-# فارق الحجم المسموح به (ml) قبل الرفض
-_VM_SIZE_TOLERANCE_ML: float = 10.0
-
-# ── قاعدة الكلمات المحظورة (Blacklist) ──────────────────────────────────────
-# أحدهما بديل/تستر والآخر أصلي = رفض قاطع بغض النظر عن باقي البيانات
-_VM_BLACKLIST_RE = re.compile(
-    r'\b(?:بديل|بدائل|مستوحى|مستوحاة|inspired\s+by|alternative|'
-    r'tester|تستر|تسترز|testers)\b',
-    re.I | re.UNICODE,
-)
-
-
-def _vm_extract_size(name: str) -> float | None:
-    """يستخرج أول حجم (ml) من الاسم. يُرجع None إذا لم يجد."""
-    m = _VM_SIZE_RE.search(str(name or ""))
-    if m:
-        try:
-            return float(m.group(1))
-        except ValueError:
-            pass
-    return None
-
-
-def _vm_extract_conc(name: str) -> str | None:
-    """
-    يستخرج التركيز العطري من الاسم.
-    يُرجع أول تطابق من _VM_CONC_PATTERNS (مُرتَّبة: EXTRAIT → EDP → EDT → …).
-    """
-    s = str(name or "")
-    for pattern, conc in _VM_CONC_PATTERNS:
-        if pattern.search(s):
-            return conc
-    return None
-
-
-def verify_perfume_match(name1: str, name2: str) -> dict:
-    """
-    طبقة تحقق Python صارمة (Hard Rules) — تعمل قبل AI وبعده.
-
-    قواعد الرفض الصارمة (بالأولوية):
-    ──────────────────────────────────────────────────────────
-    0. Blacklist: إذا أحدهما يحتوي (بديل/مستوحى/tester/تستر) والآخر لا → REJECT.
-       المنتج الأصلي لا يطابق بديلاً أو تستراً أبداً.
-
-    1. عدم تماثل الحجم: إذا كان الحجم موجوداً في أحدهما ومفقوداً في الآخر → REJECT.
-       مثال: "سوفاج 100مل" vs "Sauvage EDP" → مرفوض (لا تماثل).
-
-    2. اختلاف الحجم: إذا كلاهما له حجم والفارق > 10ml → REJECT.
-       مثال: 200ml vs 100ml → فارق 100ml → مرفوض.
-
-    3. التركيز: إذا تعرّف النظام على تركيز مختلف في الاسمَين → REJECT.
-       مثال: EDT vs Parfum | EDP vs EDT | Elixir vs EDP → مرفوضة.
-
-    إذا لم يُستخرج أي من الجانبَين → لا قرار (ok=True) والـ AI يحكم.
-    ──────────────────────────────────────────────────────────
-    Returns:
-        {
-          "ok":     bool,    # True=اجتاز / False=رفض صارم
-          "reason": str,     # سبب الرفض (فارغ إذا ok=True)
-          "size1":  float|None,
-          "size2":  float|None,
-          "conc1":  str|None,
-          "conc2":  str|None,
-        }
-    """
-    n1 = str(name1 or "").strip()
-    n2 = str(name2 or "").strip()
-
-    size1 = _vm_extract_size(n1)
-    size2 = _vm_extract_size(n2)
-    conc1 = _vm_extract_conc(n1)
-    conc2 = _vm_extract_conc(n2)
-
-    # ── قاعدة 0: Blacklist — بديل/تستر vs أصلي ───────────────────────────
-    bl1 = bool(_VM_BLACKLIST_RE.search(n1))
-    bl2 = bool(_VM_BLACKLIST_RE.search(n2))
-    if bl1 != bl2:
-        tag = "بديل/مستوحى" if ("بديل" in n1.lower() or "بديل" in n2.lower()
-                                  or "مستوح" in n1.lower() or "مستوح" in n2.lower()
-                                  or "inspired" in n1.lower() or "inspired" in n2.lower()) else "تستر"
-        return {
-            "ok":     False,
-            "reason": (
-                f"[Blacklist] أحد المنتجَين يحتوي كلمة محظورة ({tag}) "
-                f"والآخر لا — مطابقة أصلي ببديل/تستر مرفوضة"
-            ),
-            "size1": size1, "size2": size2,
-            "conc1": conc1, "conc2": conc2,
-        }
-
-    # ── قاعدة 1: عدم تماثل الحجم ─────────────────────────────────────────
-    if (size1 is None) != (size2 is None):
-        has_size = size1 if size1 is not None else size2
-        return {
-            "ok":     False,
-            "reason": (
-                f"[Volume Asymmetry] حجم موجود ({has_size:.0f}ml) في أحد المنتجَين "
-                f"ومفقود في الآخر — مطابقة 0%"
-            ),
-            "size1": size1, "size2": size2,
-            "conc1": conc1, "conc2": conc2,
-        }
-
-    # ── قاعدة 2: اختلاف الحجم ────────────────────────────────────────────
-    if size1 is not None and size2 is not None:
-        diff = abs(size1 - size2)
-        if diff > _VM_SIZE_TOLERANCE_ML:
-            return {
-                "ok":     False,
-                "reason": (
-                    f"[Volume Mismatch] {size1:.0f}ml ≠ {size2:.0f}ml "
-                    f"(فارق {diff:.0f}ml > {_VM_SIZE_TOLERANCE_ML:.0f}ml)"
-                ),
-                "size1": size1, "size2": size2,
-                "conc1": conc1, "conc2": conc2,
-            }
-
-    # ── قاعدة 3: التركيز ──────────────────────────────────────────────────
-    if conc1 and conc2 and conc1 != conc2:
-        pair = frozenset([conc1, conc2])
-        if pair in _VM_INCOMPATIBLE:
-            return {
-                "ok":     False,
-                "reason": (
-                    f"[Concentration Mismatch] {conc1} ≠ {conc2} — مطابقة مستحيلة"
-                ),
-                "size1": size1, "size2": size2,
-                "conc1": conc1, "conc2": conc2,
-            }
-
-    return {
-        "ok":     True,
-        "reason": "",
-        "size1":  size1, "size2":  size2,
-        "conc1":  conc1, "conc2":  conc2,
-    }
-
-
 def verify_match(p1, p2, pr1=0, pr2=0):
-    # ── مرحلة 0: الفحص الصارم بالـ Python قبل أي استدعاء AI ─────────────────
-    _vmr = verify_perfume_match(p1, p2)
-    if not _vmr["ok"]:
-        # رفض صارم — لا حاجة للـ AI، التركيز أو الحجم مختلف
-        _logger.info(
-            "verify_match HARD-REJECT: «%s» vs «%s» — %s",
-            p1[:60], p2[:60], _vmr["reason"],
-        )
-        return {
-            "success":        True,
-            "match":          False,
-            "confidence":     0,
-            "reason":         _vmr["reason"],
-            "correct_section": "مفقود",
-            "suggested_price": 0,
-            "hard_reject":    True,
-            "conc1":          _vmr.get("conc1"),
-            "conc2":          _vmr.get("conc2"),
-            "size1":          _vmr.get("size1"),
-            "size2":          _vmr.get("size2"),
-        }
-
-    # ── مرحلة 1: AI ───────────────────────────────────────────────────────────
     diff = pr1 - pr2 if pr1 > 0 and pr2 > 0 else 0
     if pr1 > 0 and pr2 > 0:
         if diff > 10:     expected = "سعر اعلى"
@@ -1061,33 +816,22 @@ def verify_match(p1, p2, pr1=0, pr2=0):
     else:
         expected = "تحت المراجعة"
 
-    # أضف معلومات الحجم والتركيز المستخرجة في الـ prompt للمساعدة
-    _ctx = ""
-    if _vmr.get("conc1") or _vmr.get("size1"):
-        _ctx = (
-            f"\n[تحليل Python مسبق] منتج 1: حجم={_vmr.get('size1') or '?'}ml "
-            f"/ تركيز={_vmr.get('conc1') or '؟'} | "
-            f"منتج 2: حجم={_vmr.get('size2') or '?'}ml "
-            f"/ تركيز={_vmr.get('conc2') or '؟'}"
-        )
-
     prompt = f"""تحقق من تطابق هذين المنتجين بدقة متناهية (99.9%):
 منتج 1 (مهووس): {p1} | السعر: {pr1:.0f} ريال
-منتج 2 (المنافس): {p2} | السعر: {pr2:.0f} ريال{_ctx}
+منتج 2 (المنافس): {p2} | السعر: {pr2:.0f} ريال
 
-قواعد الرفض الصارمة (لا استثناء):
+قواعد المطابقة المنطقية (صارمة):
 1. الماركة متطابقة تماماً.
-2. خط العطر متطابق (Sauvage ≠ Sauvage Elixir ≠ Sauvage Elixir Parfum).
-3. الحجم بالمل متطابق — **50ml مقابل 100ml = مطابقة 0%** حتى لو تطابق الاسم.
-4. التركيز متطابق — EDT ≠ EDP ≠ Parfum ≠ Extrait ≠ Elixir ≠ Body Mist.
-   مثال صارم: «إيروس أو دو تواليت 200ml» ≠ «إيروس بارفيوم» (EDT vs Parfum).
+2. خط العطر متطابق (Sauvage ≠ Sauvage Elixir).
+3. الحجم بالمل متطابق — **50 مل مقابل 100 مل = مطابقة 0%** حتى لو تطابق الاسم.
+4. التركيز متطابق (EDP ≠ Parfum ≠ EDT) — مثال: **Sauvage EDP ≠ Sauvage Parfum**.
 5. الجنس متطابق (Men ≠ Women).
 
-إذا تعذّر تحقق أي شرط أعلاه، فالمطابقة **false** وconfidence = 0.
+إذا تعذر تحقق أي شرط أعلاه، فالمطابقة **false** وconfidence منخفضة.
 
-إذا كانت كل الشروط متوفرة، أجب بـ:
+إذا كانت كل الشروط أعلاه متوفرة، أجب بـ:
 - القسم الصحيح = {expected}
-خلاف ذلك:
+خلاف ذلك، أجب بـ:
 - القسم الصحيح = مفقود"""
 
     sys = PAGE_PROMPTS["verify"]
@@ -1096,16 +840,6 @@ def verify_match(p1, p2, pr1=0, pr2=0):
         return {"success":False,"match":False,"confidence":0,"reason":"فشل AI","correct_section":"تحت المراجعة","suggested_price":0}
     data = _parse_json(txt)
     if data:
-        # ── مرحلة 2: فحص Python بعد AI — لا تقبل "match=true" إذا اختلف التركيز/الحجم
-        if data.get("match") is True:
-            _post = verify_perfume_match(p1, p2)
-            if not _post["ok"]:
-                data["match"]          = False
-                data["confidence"]     = 0
-                data["reason"]         = f"[Python Override] {_post['reason']}"
-                data["correct_section"] = "مفقود"
-                data["hard_reject"]    = True
-                return {"success": True, **data}
         sec = data.get("correct_section","")
         if "اعلى" in sec or "أعلى" in sec: data["correct_section"] = "سعر اعلى"
         elif "اقل" in sec or "أقل" in sec:  data["correct_section"] = "سعر اقل"
@@ -1113,143 +847,42 @@ def verify_match(p1, p2, pr1=0, pr2=0):
         elif "مفقود" in sec:                 data["correct_section"] = "مفقود"
         else: data["correct_section"] = expected if data.get("match") else "مفقود"
         return {"success":True, **data}
-    # النص الخام بدون JSON: أي مطابقة بنسبة < 85% تُعدّ مفقودة
-    _tl = txt.lower()
-    match = bool(re.search(r'\btrue\b', _tl)) or "نعم" in txt
-    # رفض أي مطابقة غير مؤكدة من مسار النص الخام (< 85% ثقة)
-    return {
-        "success": True,
-        "match": False,
-        "confidence": 0,
-        "reason": f"[Threshold Reject] استجابة AI غير JSON — مطابقة غير مؤكدة: {txt[:200]}",
-        "correct_section": "مفقود",
-        "suggested_price": 0,
-    }
+    match = "true" in txt.lower() or "نعم" in txt
+    return {"success":True,"match":match,"confidence":65,"reason":txt[:200],"correct_section":expected if match else "مفقود","suggested_price":0}
 
 # ══ إعادة تصنيف قسم "تحت المراجعة" ════════════════════════════════════════
-_RC_BATCH = 10   # حجم الدفعة الواحدة — يمنع timeout ويحسن دقة JSON
-
-
-def _fallback_review_items(batch: list, offset: int) -> list:
-    """يُبقي المنتجات بحالة 'تحت المراجعة' عند فشل AI — بدلاً من إسقاطها صامتاً."""
-    return [
-        {"idx": offset + i, "section": "⚠️ تحت المراجعة",
-         "confidence": 0, "match": False, "reason": "فشل AI"}
-        for i in range(len(batch))
-    ]
-
-
-def _reclassify_batch(batch: list, offset: int) -> list:
-    """
-    تصنيف دفعة واحدة (≤ _RC_BATCH منتجات).
-    offset: الرقم الأساسي للـ idx الأصلي (لتصحيح الترقيم عند دمج الدفعات).
-
-    الجديد: يُطبّق verify_perfume_match على كل زوج قبل الإرسال للـ AI.
-    المنتجات المرفوضة hard-reject تُحوَّل مباشرة لـ "مفقود" بدون استهلاك AI.
-    """
+def reclassify_review_items(items):
+    if not items: return []
     lines = []
-    hard_rejected: dict[int, dict] = {}  # local_idx → نتيجة الرفض المسبق
-
-    for i, it in enumerate(batch):
-        our_name  = str(it.get("our", "") or "")
-        comp_name = str(it.get("comp", "") or "")
-
-        # ── فحص صارم مسبق (Hard Firewall) ───────────────────────────────
-        _vmr = verify_perfume_match(our_name, comp_name)
-        if not _vmr["ok"]:
-            _logger.info(
-                "_reclassify_batch HARD-REJECT [%d]: «%s» vs «%s» — %s",
-                offset + i + 1, our_name[:50], comp_name[:50], _vmr["reason"],
-            )
-            hard_rejected[i + 1] = {
-                "idx":        i + 1 + offset,
-                "section":    "🔍 مفقود",
-                "confidence": 0,
-                "match":      False,
-                "reason":     _vmr["reason"],
-                "hard_reject": True,
-            }
-            continue  # لا يُرسل للـ AI
-
-        diff = it.get("our_price", 0) - it.get("comp_price", 0)
-        lines.append(
-            f"[{i + 1}] منتجنا: {our_name} ({it.get('our_price', 0):.0f}ر.س)"
-            f" vs منافس: {comp_name} ({it.get('comp_price', 0):.0f}ر.س)"
-            f" | فرق: {diff:+.0f}ر.س"
-        )
-
-    # إذا كل الدفعة مرفوضة hard → لا حاجة للـ AI
-    if not lines:
-        return [hard_rejected[k] for k in sorted(hard_rejected)]
-
-    prompt = (
-        "حلل المنتجات التالية وأعد JSON فقط بالصيغة المطلوبة:\n"
-        + "\n".join(lines)
-        + "\n\nأعد JSON فقط — لا أي نص قبله أو بعده:\n"
-        + '{"results":[{"idx":1,"section":"القسم","confidence":85,"match":true,"reason":"سبب"},...]} '
-        + f"(يجب أن يحتوي على {len(lines)} عنصر بالضبط)"
-    )
-    sys_prompt = PAGE_PROMPTS["reclassify"]
-    txt = _call_gemini(prompt, sys_prompt, temperature=0.1) or _call_openrouter(prompt, sys_prompt)
-    if not txt:
-        _logger.warning("_reclassify_batch: AI لم يُرجع نصاً — %d منتج يبقى تحت المراجعة", len(lines))
-        ai_results = _fallback_review_items(batch, offset)
-    else:
-        data = _parse_json(txt)
-        if not (data and "results" in data):
-            _logger.warning("_reclassify_batch: JSON غير صالح — %d منتج يبقى تحت المراجعة | نص[:200]=%s",
-                            len(lines), (txt or "")[:200])
-            ai_results = _fallback_review_items(batch, offset)
-        else:
-            ai_results = []
-            for r in data["results"]:
-                try:
-                    local_idx = int(r.get("idx", 0) or 0)
-                except Exception:
-                    local_idx = 0
-                r["idx"] = local_idx + offset
-
-                # ── فحص بعد AI: رفض أي مطابقة confidence < 85 ──────────
-                if r.get("match") and int(r.get("confidence", 0) or 0) < 85:
-                    r["match"]     = False
-                    r["section"]   = "مفقود"
-                    r["reason"]    = (
-                        f"[Threshold Reject] confidence={r.get('confidence')}% < 85% — {r.get('reason','')}"
-                    )
-
-                sec = r.get("section", "")
-                if "اعلى" in sec or "أعلى" in sec:
-                    r["section"] = "🔴 سعر أعلى"
-                elif "اقل" in sec or "أقل" in sec:
-                    r["section"] = "🟢 سعر أقل"
-                elif "موافق" in sec:
-                    r["section"] = "✅ موافق"
-                elif "مفقود" in sec:
-                    r["section"] = "🔍 مفقود"
-                else:
-                    r["section"] = "⚠️ تحت المراجعة"
-                ai_results.append(r)
-
-    # ── دمج نتائج AI مع المرفوضات المسبقة وترتيبها ───────────────────────
-    out = list(hard_rejected.values()) + ai_results
-    out.sort(key=lambda x: x.get("idx", 0))
-    return out
-
-
-def reclassify_review_items(items: list) -> list:
-    """
-    يُعيد تصنيف قائمة المنتجات (تحت المراجعة) عبر Gemini Flash.
-    يُعالج في دفعات صغيرة (_RC_BATCH) لتجنب timeout وضمان JSON سليم.
-    يُعيد قائمة نتائج مدمجة من كل الدفعات.
-    """
-    if not items:
-        return []
-    all_results: list = []
-    for start in range(0, len(items), _RC_BATCH):
-        batch = items[start: start + _RC_BATCH]
-        batch_res = _reclassify_batch(batch, offset=start)
-        all_results.extend(batch_res)
-    return all_results
+    for i, it in enumerate(items):
+        diff = it.get("our_price",0) - it.get("comp_price",0)
+        lines.append(f"[{i+1}] منتجنا: {it['our']} ({it.get('our_price',0):.0f}ر.س)"
+                     f" vs منافس: {it['comp']} ({it.get('comp_price',0):.0f}ر.س) | فرق: {diff:+.0f}ر.س")
+    prompt = f"""حلل هذه المنتجات وحدد القسم الصحيح لكل منها:
+{chr(10).join(lines)}
+«نفس المنتج» = نفس SKU (ماركة + خط + حجم مل + تركيز). اختلاف حجم أو تركيز → ليس نفس المنتج → مفقود/مراجعة.
+- سعر اعلى: نفس المنتج (SKU) + سعرنا أعلى بـ10+ ريال
+- سعر اقل: نفس المنتج (SKU) + سعرنا أقل بـ10+ ريال
+- موافق: نفس المنتج + فرق 10 ريال أو أقل
+- مفقود: ليسا نفس المنتج (مثلاً حجم/تركيز مختلف)"""
+    sys = PAGE_PROMPTS["reclassify"]
+    txt = _call_gemini(prompt, sys, temperature=0.1) or _call_openrouter(prompt, sys)
+    if not txt: return []
+    data = _parse_json(txt)
+    if data and "results" in data:
+        for r in data["results"]:
+            try:
+                r["idx"] = int(r.get("idx", 0) or 0)
+            except Exception:
+                r["idx"] = 0
+            sec = r.get("section","")
+            if "اعلى" in sec or "أعلى" in sec: r["section"] = "🔴 سعر أعلى"
+            elif "اقل" in sec or "أقل" in sec:  r["section"] = "🟢 سعر أقل"
+            elif "موافق" in sec:                 r["section"] = "✅ موافق"
+            elif "مفقود" in sec:                 r["section"] = "🔵 مفقود"
+            else:                                 r["section"] = "⚠️ تحت المراجعة"
+        return data["results"]
+    return []
 
 # ══ بحث أسعار السوق ══════════════════════════════════════════════════════
 def search_market_price(product_name, our_price=0):
@@ -1624,378 +1257,3 @@ def get_catalog_status() -> dict:
                                       CATEGORIES_CSV_FILE, CATEGORIES_CSV_COL),
         "missing_brands": missing_stat,
     }
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-#  مولّد الوصف الآلي لسلة — AI Product Description Generator
-# ══════════════════════════════════════════════════════════════════════════════
-
-def generate_salla_html_description(product_name: str, raw_scraped_text: str = "") -> str:
-    """
-    يستخدم Gemini لاستخراج المكونات الحقيقية من النص الخام وصياغتها بتنسيق HTML
-    الخاص بمتجر "مهووس" للعطور — مناسب للرفع المباشر على سلة.
-
-    القواعد:
-    - درجة الحرارة 0.1 — شبه حتمي لمنع التأليف في المكونات.
-    - يمنع منعاً باتاً تأليف مكونات غير موجودة في النص الخام.
-    - المخرج HTML نظيف بدون markdown أو code fences.
-    """
-    raw_section = (
-        f"\nالمعلومات المسحوبة من صفحة المنافس:\n{raw_scraped_text[:1200]}"
-        if (raw_scraped_text or "").strip()
-        else "\nلم تتوفر معلومات مسحوبة — اعتمد على اسم العطر فقط."
-    )
-
-    prompt = f"""أنت خبير عطور وكاتب محتوى محترف لمتجر "مهووس" للعطور.
-اسم العطر: {product_name}{raw_section}
-
-المطلوب:
-1. استخرج المكونات العطرية الحقيقية (القمة، القلب، القاعدة) من المعلومات المسحوبة. يمنع منعاً باتاً تأليف أي مكونات غير موجودة في المصدر. إذا لم تجد مكونات محددة اكتب فقط: مزيج عطري فاخر وسري.
-2. اكتب وصفاً تسويقياً جذاباً من سطرين يعكس شخصية العطر.
-3. أعد المخرجات بصيغة HTML نظيفة تماماً — بدون markdown وبدون كود مُغلَّق (code fences).
-
-هيكل HTML المطلوب حرفياً (لا تغيّر الوسوم):
-<h2>وصف العطر</h2>
-<p>[وصف تسويقي جذاب من سطرين]</p>
-<h3>الهرم العطري</h3>
-<ul>
-<li><strong>إفتتاحية العطر:</strong> [المكونات]</li>
-<li><strong>قلب العطر:</strong> [المكونات]</li>
-<li><strong>قاعدة العطر:</strong> [المكونات]</li>
-</ul>
-<h3>لمسة خبير من مهووس</h3>
-<p>الفوحان: [/10] | الثبات: [/10] | نصيحة: [نصيحة قصيرة للاستخدام]</p>"""
-
-    raw = _call_gemini(prompt, temperature=0.1, max_tokens=2048)
-
-    if not raw:
-        # fallback: OpenRouter ثم Cohere
-        raw = _call_openrouter(prompt) or _call_cohere(prompt)
-
-    if not raw:
-        return (
-            f"<h2>وصف العطر</h2>"
-            f"<p>{product_name} — عطر فاخر يجمع بين الأناقة والعراقة.</p>"
-            f"<h3>الهرم العطري</h3>"
-            f"<ul><li><strong>إفتتاحية العطر:</strong> مزيج عطري فاخر وسري</li>"
-            f"<li><strong>قلب العطر:</strong> مزيج عطري فاخر وسري</li>"
-            f"<li><strong>قاعدة العطر:</strong> مزيج عطري فاخر وسري</li></ul>"
-            f"<h3>لمسة خبير من مهووس</h3>"
-            f"<p>الفوحان: —/10 | الثبات: —/10 | نصيحة: ارتدِه في المناسبات الخاصة.</p>"
-        )
-
-    # تنظيف: إزالة markdown code fences إن وُجدت
-    cleaned = re.sub(r"```(?:html)?\s*", "", raw, flags=re.I)
-    cleaned = re.sub(r"```", "", cleaned).strip()
-    return cleaned
-
-
-def _parse_brand_json_block(text: str) -> dict:
-    """يستخرج كائن JSON من مخرجات Gemini (مع أو بدون code fences)."""
-    if not text or not str(text).strip():
-        return {}
-    t = str(text).strip()
-    m = re.search(r"```(?:json)?\s*([\s\S]*?)\s*```", t, re.I)
-    if m:
-        try:
-            j = json.loads(m.group(1).strip())
-            if isinstance(j, dict) and "brand_name" in j:
-                return j
-        except Exception:
-            pass
-    last = t.rfind("\n{")
-    if last == -1:
-        last = t.rfind("{")
-    if last != -1:
-        tail = t[last:]
-        depth = 0
-        end = None
-        for i, c in enumerate(tail):
-            if c == "{":
-                depth += 1
-            elif c == "}":
-                depth -= 1
-                if depth == 0:
-                    end = i + 1
-                    break
-        if end:
-            try:
-                j = json.loads(tail[:end])
-                if isinstance(j, dict):
-                    return j
-            except Exception:
-                pass
-    return {}
-
-
-def _clamp_salla_brand_dict(d: dict, original_brand: str) -> dict:
-    """فرض الحدود القصوى لسلة بعد الاستلام من النموذج."""
-    bn = str(d.get("brand_name", "") or "").strip()
-    if not bn and original_brand:
-        bn = str(original_brand).strip()[:30]
-    if len(bn) > 30:
-        bn = bn[:30]
-    desc = str(d.get("description", "") or "").strip()
-    if len(desc) > 250:
-        desc = desc[:250]
-    stitle = str(d.get("seo_title", "") or "").strip()
-    if len(stitle) > 70:
-        stitle = stitle[:70]
-    sdesc = str(d.get("seo_desc", "") or "").strip()
-    if len(sdesc) > 155:
-        sdesc = sdesc[:155]
-    surl = str(d.get("seo_url", "") or "").strip().lower()
-    surl = re.sub(r"\s+", "_", surl)
-    surl = re.sub(r"[^a-z0-9_-]", "", surl)
-    if not surl or len(surl) < 3:
-        safe = re.sub(r"[^a-z0-9]+", "_", original_brand.lower().strip())[:24].strip("_")
-        if not safe:
-            safe = hashlib.md5(original_brand.encode("utf-8")).hexdigest()[:10]
-        surl = f"{safe}_mahwous"
-    elif "mahwous" not in surl:
-        surl = (surl + "_mahwous")[:80]
-    surl = surl[:80]
-    return {
-        "brand_name": bn,
-        "description": desc,
-        "seo_title": stitle,
-        "seo_url": surl,
-        "seo_desc": sdesc,
-    }
-
-
-def generate_salla_brand_info(brand_name: str) -> dict:
-    """
-    يولد بيانات الماركة (وصف، SEO) بتنسيق متوافق مع سلة مع الالتزام الصارم
-    بالحد الأقصى للأحرف: اسم 30، وصف 250، عنوان SEO 70، وصف SEO 155.
-    """
-    bn = str(brand_name or "").strip()
-    if not bn or bn.lower() in ("nan", "none"):
-        return _clamp_salla_brand_dict({}, "")
-
-    prompt = f"""أنت خبير عطور وSEO محترف لمتجر "مهووس".
-لدينا ماركة عطور جديدة مفقودة اسمها: "{bn}".
-
-المطلوب توليد بيانات الماركة بدقة وإرجاعها ككائن JSON فقط. يجب الالتزام الصارم بالحدود القصوى للأحرف (عدّ كل حرف بما فيه المسافات والعربية):
-1. "brand_name": اسم الماركة باللغتين (العربية | الإنجليزية). حد أقصى 30 حرفاً. (مثال: كريبتك | Cryptic).
-2. "description": وصف جذاب للماركة يبرز فخامتها. حد أقصى 250 حرفاً.
-3. "seo_title": عنوان صفحة SEO يدمج اسم الماركة مع "متجر مهووس". حد أقصى 70 حرفاً.
-4. "seo_url": رابط صفحة الماركة بحروف إنجليزية صغيرة فقط مع mahwous مفصولة بشرطة سفلية (مثال: cryptic_mahwous).
-5. "seo_desc": وصف صفحة الماركة للبحث. حد أقصى 155 حرفاً.
-
-أعد JSON فقط بدون markdown وبدون نص قبل أو بعد. المفاتيح بالإنجليزية كما أعلاه."""
-
-    try:
-        raw = _call_gemini(prompt, temperature=0.1, max_tokens=1024)
-        if not raw:
-            raw = _call_openrouter(prompt) or _call_cohere(prompt)
-        parsed = _parse_brand_json_block(raw) if raw else {}
-        if parsed:
-            return _clamp_salla_brand_dict(parsed, bn)
-    except Exception:
-        pass
-
-    # Fallback صارم يلتزم بالحدود القصوى
-    safe_name = bn[:14]
-    return _clamp_salla_brand_dict(
-        {
-            "brand_name": (f"{safe_name} | {safe_name}")[:30],
-            "description": (
-                f"عطور {safe_name} الفاخرة، اكتشف التميز والجاذبية مع تشكيلتنا المختارة بعناية في متجر مهووس."
-            )[:250],
-            "seo_title": (f"عطور {safe_name} الأصلية | متجر مهووس")[:70],
-            "seo_url": "",
-            "seo_desc": (
-                f"تسوق أحدث عطور {safe_name} الأصلية بأسعار تنافسية من متجر مهووس. اكتشف الفخامة الآن."
-            )[:155],
-        },
-        bn,
-    )
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-#  🦅 Hawk-Eye Vision — التحقق البصري عبر Gemini Vision
-# ══════════════════════════════════════════════════════════════════════════════
-
-def get_base64_from_url(url: str, timeout: int = 10) -> str | None:
-    """
-    يحمّل صورة من URL ويحوّلها إلى Base64.
-
-    Returns:
-        سلسلة Base64 عند النجاح، أو None عند أي فشل (الشبكة، MIME، إلخ).
-    """
-    if not (url or "").strip():
-        return None
-    try:
-        resp = requests.get(
-            url.strip(),
-            timeout=timeout,
-            headers={"User-Agent": "Mozilla/5.0 (compatible; MahwousVision/1.0)"},
-        )
-        resp.raise_for_status()
-        content_type = resp.headers.get("Content-Type", "")
-        # رفض الردود غير الصورية (HTML، JSON، إلخ)
-        if not any(t in content_type for t in ("image/", "application/octet-stream")):
-            return None
-        return base64.b64encode(resp.content).decode("utf-8")
-    except Exception:
-        return None
-
-
-def visual_verify_match(
-    our_img_url: str,
-    comp_img_url: str,
-    product_name: str,
-) -> dict:
-    """
-    يقارن بصرياً بين صورتين عبر Gemini Vision للتأكد من تطابق العطر الفعلي.
-
-    يفيد في حلّ حالات "المنطقة الرمادية" حيث الأسماء متشابهة لكن قد تكون
-    إصدارات مختلفة (مثال: نفس الماركة بحجم زجاجة مختلف أو لون مختلف).
-
-    Args:
-        our_img_url:  رابط صورة منتجنا.
-        comp_img_url: رابط صورة منتج المنافس.
-        product_name: اسم العطر المفترض (للسياق في الـ Prompt).
-
-    Returns:
-        dict مع المفاتيح:
-            - match  (bool):   هل الصورتان لنفس العطر تماماً؟
-            - reason (str):    تبرير مرئي موجز (سطر واحد).
-            - source (str):    مصدر القرار ("gemini_vision" | "fallback").
-    """
-    # ── التحقق من توفر الصور ────────────────────────────────────────────
-    if not our_img_url or not comp_img_url:
-        return {"match": False, "reason": "الصور غير متوفرة للتحقق البصري.", "source": "fallback"}
-
-    our_b64  = get_base64_from_url(our_img_url)
-    comp_b64 = get_base64_from_url(comp_img_url)
-
-    if not our_b64:
-        return {"match": False, "reason": "فشل تحميل صورة منتجنا.", "source": "fallback"}
-    if not comp_b64:
-        return {"match": False, "reason": "فشل تحميل صورة المنافس.", "source": "fallback"}
-
-    # ── بناء الـ Prompt ──────────────────────────────────────────────────
-    prompt = (
-        f'أنت خبير في التعرف البصري على زجاجات العطور الفاخرة.\n'
-        f'أمامك صورتان لعطر يُفترض أنه: "{product_name}".\n'
-        f'دقّق جيداً في:\n'
-        f'  1. شكل ولون الزجاجة والسائل داخلها.\n'
-        f'  2. شكل الغطاء ومادته.\n'
-        f'  3. الملصق (Label) وخط الكتابة عليه.\n'
-        f'هل الصورتان لنفس العطر تماماً (نفس الإصدار والتركيز والحجم)?\n'
-        f'أرجع JSON فقط — لا أي نص قبله أو بعده:\n'
-        f'{{"is_identical": true/false, "visual_reason": "تبرير دقيق من سطر واحد"}}'
-    )
-
-    payload = {
-        "contents": [{
-            "parts": [
-                {"text": prompt},
-                {"inline_data": {"mime_type": "image/jpeg", "data": our_b64}},
-                {"inline_data": {"mime_type": "image/jpeg", "data": comp_b64}},
-            ]
-        }],
-        "generationConfig": {"temperature": 0.0, "maxOutputTokens": 200},
-    }
-
-    # ── استدعاء Gemini Vision (يجرّب كل مفتاح متاح) ────────────────────
-    # gemini-2.0-flash يدعم الرؤية + أسرع وأرخص من 1.5-flash
-    vision_url_tpl = (
-        "https://generativelanguage.googleapis.com/v1beta"
-        f"/models/{_GM}:generateContent?key={{key}}"
-    )
-    for key in (GEMINI_API_KEYS or []):
-        if not key:
-            continue
-        try:
-            r = requests.post(
-                vision_url_tpl.format(key=key),
-                json=payload,
-                timeout=30,
-            )
-            if r.status_code != 200:
-                continue
-            raw_txt = r.json()["candidates"][0]["content"]["parts"][0]["text"]
-            clean   = re.sub(r"```json|```", "", raw_txt).strip()
-            s = clean.find("{"); e = clean.rfind("}") + 1
-            if s < 0 or e <= s:
-                continue
-            data = json.loads(clean[s:e])
-            return {
-                "match":  bool(data.get("is_identical", False)),
-                "reason": str(data.get("visual_reason", "")).strip(),
-                "source": "gemini_vision",
-            }
-        except Exception:
-            continue
-
-    # ── Graceful fallback — لا ينهار التطبيق أبداً ────────────────────
-    return {
-        "match":  False,
-        "reason": "تعذّر الاتصال بـ Gemini Vision — يُرجى إعادة المحاولة لاحقاً.",
-        "source": "fallback",
-    }
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-#  نظام المطابقة متعدد المراحل — Embedding API (Pass 4)
-# ══════════════════════════════════════════════════════════════════════════════
-
-_EMBED_URL = "https://generativelanguage.googleapis.com/v1beta/models/text-embedding-004:embedContent"
-_EMBED_CACHE: dict[str, list[float]] = {}   # ذاكرة تخزين مؤقت للـ embeddings
-
-
-def get_product_embedding(text: str) -> list[float] | None:
-    """
-    توليد embedding نصي باستخدام Gemini text-embedding-004.
-
-    يستخدم ذاكرة تخزين مؤقت (cache) لتجنب الاستدعاء المكرر لنفس النص.
-
-    Parameters
-    ----------
-    text : str — نص المنتج (الاسم + الماركة + الحجم)
-
-    Returns
-    -------
-    list[float] — متجه الـ embedding أو None عند الفشل
-    """
-    text = str(text or "").strip()[:500]
-    if not text:
-        return None
-
-    if text in _EMBED_CACHE:
-        return _EMBED_CACHE[text]
-
-    for api_key in GEMINI_API_KEYS:
-        if not api_key or not api_key.strip():
-            continue
-        try:
-            resp = requests.post(
-                f"{_EMBED_URL}?key={api_key}",
-                json={
-                    "model": "models/text-embedding-004",
-                    "content": {"parts": [{"text": text}]},
-                    "taskType": "SEMANTIC_SIMILARITY",
-                },
-                timeout=15,
-            )
-            if resp.status_code == 200:
-                vec = resp.json().get("embedding", {}).get("values")
-                if vec:
-                    _EMBED_CACHE[text] = vec
-                    return vec
-            else:
-                _log_err("get_product_embedding", f"HTTP {resp.status_code}: {resp.text[:200]}")
-        except Exception as exc:
-            _log_err("get_product_embedding", str(exc)[:200])
-
-    return None
-
-
-def clear_embedding_cache() -> int:
-    """مسح ذاكرة التخزين المؤقت للـ embeddings. يُعيد عدد الإدخالات المحذوفة."""
-    n = len(_EMBED_CACHE)
-    _EMBED_CACHE.clear()
-    return n

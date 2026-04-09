@@ -18,15 +18,15 @@ import pandas as pd
 
 try:
     from config import (AUTOMATION_RULES_DEFAULT, AUTO_DECISION_CONFIDENCE,
-                        AUTO_PUSH_TO_MAKE, AUTO_SEARCH_INTERVAL_MINUTES)
+                        AUTO_PUSH_TO_MAKE, AUTO_SEARCH_INTERVAL_MINUTES, DB_PATH)
 except ImportError:
+    from utils.data_paths import get_data_db_path
+
     AUTOMATION_RULES_DEFAULT = []
     AUTO_DECISION_CONFIDENCE = 92
     AUTO_PUSH_TO_MAKE = False
     AUTO_SEARCH_INTERVAL_MINUTES = 360
-
-# مسار DB الموحّد — دائماً من db_manager
-from utils.db_manager import DB_PATH
+    DB_PATH = get_data_db_path("perfume_pricing.db")
 
 
 # ═══════════════════════════════════════════════════════
@@ -59,13 +59,7 @@ class PricingRule:
             if diff > min_diff:
                 new_price = comp_price - undercut
                 if cost_price > 0:
-                    # حماية مستندة إلى سعر التكلفة الفعلي
                     min_allowed = cost_price * (1 - max_loss_pct / 100)
-                    new_price = max(new_price, round(min_allowed, 2))
-                elif our_price > 0:
-                    # حماية افتراضية عند غياب سعر التكلفة:
-                    # لا تخفض أكثر من max_loss_pct% من سعرنا الحالي
-                    min_allowed = our_price * (1 - max_loss_pct / 100)
                     new_price = max(new_price, round(min_allowed, 2))
                 if new_price < 1:
                     return None
