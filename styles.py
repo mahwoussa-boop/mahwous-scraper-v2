@@ -31,24 +31,10 @@ def _lazy_img_tag(src, width=40, height=40, alt="", loading="lazy"):
     if not (src or "").strip():
         return ""
     s = html.escape(first_image_url_string(str(src).strip()), quote=True)
-    if not s:
-        return ""
     a = html.escape(alt or "", quote=True)
     ld = "eager" if str(loading).lower().strip() == "eager" else "lazy"
-    # onerror: إخفاء الصورة المكسورة وإظهار placeholder بدلاً منها
-    err_js = (
-        f"this.onerror=null;"
-        f"this.style.display='none';"
-        f"var p=document.createElement('div');"
-        f"p.style='width:{width}px;height:{height}px;border-radius:6px;"
-        f"background:#121c2e;border:1px dashed #2a3f5f;display:flex;"
-        f"align-items:center;justify-content:center;color:#4a5c78;font-size:.8rem;flex-shrink:0';"
-        f"p.textContent='—';"
-        f"this.parentNode.insertBefore(p,this);"
-    )
     return (
         f'<img src="{s}" alt="{a}" loading="{ld}" decoding="async" '
-        f'onerror="{html.escape(err_js, quote=True)}" '
         f'style="width:{width}px;height:{height}px;object-fit:cover;'
         f'border-radius:6px;flex-shrink:0;opacity:1;visibility:visible;display:block"/>'
     )
@@ -250,35 +236,19 @@ def stat_card(icon, label, value, color="#6C63FF"):
 
 def vs_card(our_name, our_price, comp_name, comp_price, diff, comp_source="", product_id="",
             our_img="", comp_img="", comp_url="", our_url="",
-            accent_border=None, row_bg=None, compact=False, price_alert=""):
+            accent_border=None, row_bg=None, compact=False):
     """بطاقة VS الأساسية — المنافس الرئيسي (الأقل سعراً). our_img/comp_img/comp_url/our_url اختياريان.
     accent_border/row_bg: تنسيق اختياري لصفوف «مستبعد» (رمادي).
-    compact: وضع أصغر لقسم «سعر أعلى» (فرصة خفض).
-    price_alert: تنبيه تغيير سعر المنافس من الرادار التسعيري."""
+    compact: وضع أصغر لقسم «سعر أعلى» (فرصة خفض)."""
     dc = "#FF1744" if diff > 0 else "#00C853" if diff < 0 else "#FFD600"
     src = f'<div style="font-size:.65rem;color:#666">{comp_source}</div>' if comp_source else ""
     pid = str(product_id) if product_id and str(product_id) not in ("", "nan", "None", "0") else ""
-    pid_html = (
-        f'<div style="display:inline-block;margin-top:3px;padding:1px 6px;'
-        f'background:rgba(108,99,255,.18);border:1px solid rgba(108,99,255,.45);'
-        f'border-radius:4px;font-size:.7rem;color:#a09dff;font-weight:600;'
-        f'letter-spacing:.4px">#{pid}</div>'
-    ) if pid else (
-        f'<div style="display:inline-block;margin-top:3px;padding:1px 6px;'
-        f'background:rgba(255,71,87,.12);border:1px solid rgba(255,71,87,.35);'
-        f'border-radius:4px;font-size:.65rem;color:#ff6b6b88">لا يوجد رقم</div>'
-    )
+    pid_html = f'<div style="font-size:.65rem;color:#6C63FF99;margin-top:1px">#{pid}</div>' if pid else ""
     _iw = _ih = (56 if compact else 90)
     _fs_our = ".82rem" if compact else ".9rem"
     _fs_price = "1rem" if compact else "1.1rem"
     our_thumb = _lazy_img_tag(our_img, width=_iw, height=_ih, alt="منتجنا")
     comp_thumb = _lazy_img_tag(comp_img, width=_iw, height=_ih, alt="المنافس")
-    if not comp_thumb:
-        comp_thumb = (
-            f'<div style="width:{_iw}px;height:{_ih}px;border-radius:6px;flex-shrink:0;'
-            f'background:#121c2e;border:1px dashed #2a3f5f;display:flex;align-items:center;'
-            f'justify-content:center;color:#4a5c78;font-size:.8rem">—</div>'
-        )
     # السعر المقترح = أقل من أقل منافس بريال
     suggested = comp_price - 1 if comp_price > 0 else 0
     sugg_html = ""
@@ -297,10 +267,8 @@ def vs_card(our_name, our_price, comp_name, comp_price, diff, comp_source="", pr
     comp_title_html = _linked_product_title(
         comp_name, comp_url, color="#FFD180", font_size=_fs_our,
     )
-    # data-img: رابط صورة المنافس — للتشخيص عبر DOM بدون إظهار نص
-    _comp_img_attr = f' data-img="{html.escape(str(comp_img or ""), quote=True)}"' if comp_img else ' data-img=""'
     comp_block = (
-        f'<div class="comp-s"{_comp_img_attr} style="display:flex;align-items:flex-start;gap:10px">'
+        f'<div class="comp-s" style="display:flex;align-items:flex-start;gap:10px">'
         f'{comp_thumb}<div style="flex:1;min-width:0">'
         f'<div style="font-size:.7rem;color:#8B8B8B">المنافس المتصدر</div>'
         f'<div style="line-height:1.35">{comp_title_html}</div>'
@@ -309,24 +277,11 @@ def vs_card(our_name, our_price, comp_name, comp_price, diff, comp_source="", pr
     _foot = _comp_url_footer(comp_url)
     _vs_cls = "vs-row vs-compact" if compact else "vs-row"
     _diff_fs = ".82rem" if compact else ".9rem"
-    # ── شريط تنبيه الرادار التسعيري ──────────────────────────────────────
-    _alert_html = ""
-    _pa = str(price_alert or "").strip()
-    if _pa:
-        _is_drop = _pa.startswith("📉")
-        _alert_bg  = "rgba(0,200,83,.12)"  if _is_drop else "rgba(255,71,87,.12)"
-        _alert_bdr = "#00C853"             if _is_drop else "#FF1744"
-        _alert_html = (
-            f'<div style="background:{_alert_bg};border:1px solid {_alert_bdr};'
-            f'border-radius:6px;padding:5px 10px;margin:4px 0;'
-            f'font-size:.78rem;font-weight:700;color:{"#00C853" if _is_drop else "#FF5252"};'
-            f'text-align:center;letter-spacing:.3px">🚨 رادار التسعير: {html.escape(_pa)}</div>'
-        )
     inner = f'''<div class="{_vs_cls}">
 {our_block}
 <div class="vs-badge">VS</div>
 {comp_block}
-</div><div style="text-align:center;background:#1A1A2E;padding:3px;border-left:1px solid #333344;border-right:1px solid #333344;margin:0"><span style="color:{dc};font-weight:700;font-size:{_diff_fs}">الفرق: {diff:+.0f} ر.س</span></div>{_alert_html}{_foot}'''
+</div><div style="text-align:center;background:#1A1A2E;padding:3px;border-left:1px solid #333344;border-right:1px solid #333344;margin:0"><span style="color:{dc};font-weight:700;font-size:{_diff_fs}">الفرق: {diff:+.0f} ر.س</span></div>{_foot}'''
     if accent_border:
         bg = row_bg if row_bg is not None else "rgba(158,158,158,.10)"
         return (
@@ -394,7 +349,7 @@ def comp_strip(all_comps):
 def miss_card(name, price, brand, size, ptype, comp, suggested_price,
               note="", variant_html="", tester_badge="", border_color="#007bff44",
               confidence_level="green", confidence_score=0, product_id="", image_url="",
-              comp_url="", title_override="", gray_zone_html="", dup_compare_html=""):
+              comp_url="", title_override=""):
     """بطاقة المنتج المفقود — image_url / comp_url اختياريان.
     title_override: اسم عرض صريح (مثلاً من عمود آخر عندما يكون الاسم مخزناً كرابط)."""
     # شارة الثقة
@@ -456,8 +411,6 @@ def miss_card(name, price, brand, size, ptype, comp, suggested_price,
         f"🧴 {_pt} &nbsp;|&nbsp; 🏪 {_cp}</div>"
         f"{variant_html}"
         f"{note_html}"
-        f"{gray_zone_html}"
-        f"{dup_compare_html}"
         f"</div>"
         f'<div class="miss-prices">'
         f'<div class="miss-comp-price">{price:,.0f} ر.س</div>'
