@@ -13,23 +13,12 @@ import requests
 
 
 # ===== safe_float =====
-_AR_DIGIT_TABLE = str.maketrans('٠١٢٣٤٥٦٧٨٩', '0123456789')
-
 def safe_float(val, default=0.0) -> float:
-    """تحويل قيمة إلى float بأمان — يدعم الأرقام العربية والفواصل ورموز العملة."""
+    """تحويل قيمة إلى float بأمان"""
     try:
         if val is None or val == "" or (isinstance(val, float) and pd.isna(val)):
             return default
-        if isinstance(val, (int, float)):
-            return float(val)
-        s = str(val).strip()
-        # ترجمة الأرقام العربية-الهندية
-        s = s.translate(_AR_DIGIT_TABLE)
-        # إزالة رموز العملة والمسافات، الإبقاء على الأرقام والفاصلتين فقط
-        s = re.sub(r'[^\d.,-]', '', s)
-        # إزالة الفاصلة كفاصل آلاف (السياق: أسعار ريال سعودي)
-        s = s.replace(',', '')
-        return float(s) if s else default
+        return float(val)
     except (ValueError, TypeError):
         return default
 

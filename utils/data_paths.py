@@ -32,18 +32,3 @@ def get_catalog_data_path(filename: str) -> str:
     # جذر المشروع = أعلى بمستوى واحد من هذا الملف (utils/)
     root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     return os.path.join(root, "data", filename)
-
-
-def get_master_competitors_path() -> str:
-    """
-    مسار كتالوج المنافسين المتراكم (Competitor Master Catalog).
-    يُحترم DATA_DIR لـ Railway Volume — يسقط إلى data/ محلياً.
-    """
-    data_dir = (os.environ.get("DATA_DIR") or "").strip()
-    if data_dir:
-        os.makedirs(data_dir, exist_ok=True)
-        return os.path.join(data_dir, "master_competitors.csv")
-    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    local_data = os.path.join(root, "data")
-    os.makedirs(local_data, exist_ok=True)
-    return os.path.join(local_data, "master_competitors.csv")

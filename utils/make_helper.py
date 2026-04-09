@@ -22,10 +22,17 @@ from typing import List, Dict, Any, Optional
 
 
 # ── Webhook URLs ───────────────────────────────────────────────────────────
-# يجب ضبط هذه المتغيرات في بيئة التشغيل (Railway / .env).
-# لا يوجد fallback إنتاجي هنا — أي إرسال بدون URL سيُعيد خطأ صريحاً.
-WEBHOOK_UPDATE_PRICES = os.environ.get("WEBHOOK_UPDATE_PRICES", "").strip()
-WEBHOOK_NEW_PRODUCTS  = os.environ.get("WEBHOOK_NEW_PRODUCTS",  "").strip()
+def _get_webhook_url(key: str, default: str) -> str:
+    return os.environ.get(key, "") or default
+
+WEBHOOK_UPDATE_PRICES = _get_webhook_url(
+    "WEBHOOK_UPDATE_PRICES",
+    "https://hook.eu2.make.com/8jia6gc7s1cpkeg6catlrvwck768sbfk"
+)
+WEBHOOK_NEW_PRODUCTS = _get_webhook_url(
+    "WEBHOOK_NEW_PRODUCTS",
+    "https://hook.eu2.make.com/xvubj23dmpxu8qzilstd25cnumrwtdxm"
+)
 
 TIMEOUT = 15  # ثانية
 
@@ -132,15 +139,11 @@ def export_to_make_format(df, section_type: str = "update") -> List[Dict]:
         )
 
         if section_type == "raise":
-            # قسم "سعر أعلى": سعرنا أعلى من المنافس → نُخفّض إلى comp_price - 1
-            # الشرط: يجب أن يكون لدينا سعر أصلي وأن الهدف فعلاً أقل منه
-            _target = round(comp_price - 1, 2) if comp_price > 0 else our_price
-            price = _target if (our_price > 0 and _target < our_price) else our_price
+            # سعرنا أعلى → نُخفّض لسعر المنافس مطروحاً ريال
+            price = round(comp_price - 1, 2) if comp_price > 0 else our_price
         elif section_type == "lower":
-            # قسم "سعر أقل": سعرنا أقل من المنافس → نرفع إلى comp_price - 1 (نزيد الهامش)
-            # الشرط: يجب أن يكون الهدف فعلاً أعلى من سعرنا الحالي
-            _target = round(comp_price - 1, 2) if comp_price > 0 else our_price
-            price = _target if (our_price > 0 and _target > our_price) else our_price
+            # سعرنا أقل → نرفع لسعر المنافس مطروحاً ريال (نبقى أقل بريال)
+            price = round(comp_price - 1, 2) if comp_price > 0 else our_price
         elif section_type in ("approved", "update"):
             price = our_price
         else:
@@ -203,18 +206,12 @@ def send_single_product(product: Dict) -> Dict:
         return {"success": False, "message": "❌ اسم المنتج مطلوب"}
     if price <= 0:
         return {"success": False, "message": f"❌ السعر غير صحيح: {price}"}
-    if not product_id:
-        return {
-            "success": False,
-            "message": f"❌ رقم المنتج (ID) مطلوب لتحديث سلة — «{name}» لا يملك رقماً. أضف عمود رقم المنتج في ملف كتالوجك.",
-        }
 
     # ── Payload مطابق لما يقرأه Make: {{2.products}} ─────────────────────
-    # Salla UpdateProduct يتوقع price كـ uinteger
     _prod = {
         "product_id":  product_id,
         "name":        name,
-        "price":       int(round(price)),
+        "price":       float(price),
         "section":     product.get("section", "update"),
         "comp_name":   product.get("comp_name", ""),
         "competitor":  product.get("competitor", ""),
@@ -288,14 +285,14 @@ def send_price_updates(products: List[Dict]) -> Dict:
         price      = _safe_float(p.get("price", 0))
         product_id = _clean_pid(p.get("product_id", ""))
 
-        if not name or price <= 0 or not product_id:
+        if not name or price <= 0:
             skipped += 1
             continue
 
         valid_products.append({
             "product_id":  product_id,
             "name":        name,
-            "price":       int(round(price)),
+            "price":       float(price),
             "section":     p.get("section", "update"),
             "comp_name":   p.get("comp_name", ""),
             "competitor":  p.get("competitor", ""),
@@ -350,15 +347,14 @@ def send_new_products(products: List[Dict]) -> Dict:
             continue
 
         # ── بنية البيانات المطابقة لـ Interface سيناريو Make ─────────────
-        # Salla CreateProduct يتوقع uinteger للأسعار والوزن → int(round(...))
         item = {
             "product_id":      pid,
             "أسم المنتج":      name,
-            "سعر المنتج":      int(round(float(price))) if price else 0,
+            "سعر المنتج":      float(price),
             "رمز المنتج sku":  str(p.get("sku", p.get("رمز المنتج sku", ""))).strip(),
-            "الوزن":           max(1, int(round(_safe_float(p.get("weight", p.get("الوزن", 1))) or 1))),
-            "سعر التكلفة":     int(round(_safe_float(p.get("cost_price", p.get("سعر التكلفة", 0))))),
-            "السعر المخفض":    int(round(_safe_float(p.get("sale_price",  p.get("السعر المخفض", 0))))),
+            "الوزن":           int(_safe_float(p.get("weight", p.get("الوزن", 1))) or 1),
+            "سعر التكلفة":     float(_safe_float(p.get("cost_price", p.get("سعر التكلفة", 0)))),
+            "السعر المخفض":    float(_safe_float(p.get("sale_price",  p.get("السعر المخفض", 0)))),
             "الوصف":           str(p.get("الوصف", p.get("description", ""))).strip(),
         }
         # حقل صورة اختياري
@@ -409,15 +405,14 @@ def send_missing_products(products: List[Dict]) -> Dict:
             continue
 
         # ── بنية البيانات المطابقة لـ Interface سيناريو Make ─────────────
-        # Salla CreateProduct يتوقع uinteger للأسعار والوزن → int(round(...))
         item = {
             "product_id":      pid,
             "أسم المنتج":      name,
-            "سعر المنتج":      int(round(float(price))) if price else 0,
+            "سعر المنتج":      float(price),
             "رمز المنتج sku":  str(p.get("sku", p.get("رمز المنتج sku", ""))).strip(),
-            "الوزن":           max(1, int(round(_safe_float(p.get("weight", p.get("الوزن", 1))) or 1))),
-            "سعر التكلفة":     int(round(_safe_float(p.get("cost_price", p.get("سعر التكلفة", 0))))),
-            "السعر المخفض":    int(round(_safe_float(p.get("sale_price",  p.get("السعر المخفض", 0))))),
+            "الوزن":           int(_safe_float(p.get("weight", p.get("الوزن", 1))) or 1),
+            "سعر التكلفة":     float(_safe_float(p.get("cost_price", p.get("سعر التكلفة", 0)))),
+            "السعر المخفض":    float(_safe_float(p.get("sale_price",  p.get("السعر المخفض", 0)))),
             "الوصف":           str(p.get("الوصف", p.get("description", ""))).strip(),
         }
         if p.get("image_url"):
@@ -541,7 +536,7 @@ def verify_webhook_connection() -> Dict:
         "products": [{
             "product_id": "test-001",
             "name":       "اختبار الاتصال",
-            "price":      1,
+            "price":      1.0,
             "section":    "test",
         }]
     }
@@ -552,12 +547,12 @@ def verify_webhook_connection() -> Dict:
         "data": [{
             "product_id":     "",
             "أسم المنتج":     "اختبار الاتصال",
-            "سعر المنتج":     1,
-            "رمز المنتج sku": "TEST-SKU-001",
+            "سعر المنتج":     1.0,
+            "رمز المنتج sku": "",
             "الوزن":          1,
             "سعر التكلفة":    0,
             "السعر المخفض":   0,
-            "الوصف":          "اختبار تلقائي من نظام مهووس للتحقق من الاتصال",
+            "الوصف":          "test",
         }]
     }
     r2 = _post_to_webhook(WEBHOOK_NEW_PRODUCTS, test_new_payload)

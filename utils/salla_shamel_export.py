@@ -1,36 +1,292 @@
 """
-utils/salla_shamel_export.py — تصدير سلة الشامل (Production-Ready v2.0)
-═══════════════════════════════════════════════════════════════════════
-• رؤوس أعمدة مطابقة حرفياً لقالب سلة 2024
-• ترميز UTF-8 مع BOM (utf-8-sig) — Excel وسلة يتعرفان على العربية
-• مطابقة التصنيفات والماركات من ملفات CSV الرسمية (fuzzy match)
-• لا أعمدة زائدة — أي حقل خارج القالب يُرفض من سلة
+تصدير منتجات مفقودة بتنسيق CSV سلة الشامل المحدث.
+مطابق تماماً لنموذج "منتججديد.csv" المرفق.
+v29.0 - وضع المطابقة الصارمة (Strict Matching) لتجنب أخطاء الاستيراد.
 """
-import csv
-import functools
 import html
 import io
-import logging
-import os
+import csv
 import re
-from typing import Optional
+import json
+import uuid
+import difflib
+from datetime import datetime
+from typing import List, Dict, Any, Tuple, Optional
 
 import pandas as pd
 
+from engines.ai_engine import auto_infer_category, generate_mahwous_description
+from engines.mahwous_core import sanitize_salla_text, format_mahwous_description
+from engines.prompts import (
+    SALLA_BRANDS_FILE, SALLA_BRANDS_COL,
+    BRANDS_CSV_FILE, BRANDS_CSV_COL,
+    SALLA_CATEGORIES_FILE, SALLA_CATEGORIES_COL,
+    CATEGORIES_CSV_FILE, CATEGORIES_CSV_COL,
+)
+from utils.data_paths import get_catalog_data_path
 from utils.helpers import safe_float
-
-_logger = logging.getLogger(__name__)
+from utils.data_sanitizer import (
+    standardize_terms,
+    sanitize_description_terms,
+    get_brand_arabic_name,
+    validate_product_data,
+    extract_size_ml,
+)
 
 _HTML_TAG_RE = re.compile(r"<[^>]+>")
+_ALT_SAFE_RE = re.compile(r"[^0-9A-Za-z\u0600-\u06FF\s]")
 
-# ══════════════════════════════════════════════════════════════════════════════
-#  قالب سلة 2024 — الأعمدة بالترتيب والمسمى الحرفي
-#  تنبيه: "النوع " (مسافة في النهاية) و"أسم المنتج" (همزة قطع) — لا تغيّرهما
-#  "الكمية المتوفرة" محذوف — غير موجود في القالب الجديد لعام 2024
-# ══════════════════════════════════════════════════════════════════════════════
+
+def _markdown_to_salla_html(md_text: str) -> str:
+    """تحويل نص Markdown إلى HTML بسيط مناسب لسلة."""
+    lines = md_text.strip().split("\n")
+    out = []
+    in_ul = False
+    for line in lines:
+        line = line.rstrip()
+        if line.startswith("### "):
+            if in_ul: out.append("</ul>"); in_ul = False
+            out.append(f"<h3>{line[4:].strip()}</h3>")
+        elif line.startswith("## "):
+            if in_ul: out.append("</ul>"); in_ul = False
+            out.append(f"<h2>{line[3:].strip()}</h2>")
+        elif line.startswith("# "):
+            if in_ul: out.append("</ul>"); in_ul = False
+            out.append(f"<h2>{line[2:].strip()}</h2>")
+        elif line.startswith("* ") or line.startswith("- "):
+            if not in_ul: out.append("<ul>"); in_ul = True
+            item = re.sub(r"\*\*(.+?)\*\*", r"<strong>\1</strong>", line[2:].strip())
+            out.append(f"<li>{item}</li>")
+        elif not line.strip():
+            if in_ul: out.append("</ul>"); in_ul = False
+        else:
+            if in_ul: out.append("</ul>"); in_ul = False
+            para = re.sub(r"\*\*(.+?)\*\*", r"<strong>\1</strong>", line)
+            out.append(f"<p>{para}</p>")
+    if in_ul: out.append("</ul>")
+    return "\n".join(out)
+
+
+
+def _debug_log(hypothesis_id: str, location: str, message: str, data: dict | None = None, run_id: str = "pre-fix") -> None:
+    pass
+
+
+def _norm_brand(s: str) -> str:
+    t = sanitize_salla_text(str(s or "")).strip().lower()
+    t = re.sub(r"[\|\-_/]", " ", t)
+    t = re.sub(r"\s+", " ", t).strip()
+    return t
+
+
+def _load_store_brands() -> list[str]:
+    """تحميل الماركات الرسمية — يجرب عدة أسماء ملفات (مسافة / شرطة سفلية)."""
+    brands: list[str] = []
+    # الأولوية: ماركات_مهووس.csv (underscore) ثم ماركات مهووس.csv (space) ثم brands.csv
+    candidate_files = [
+        (SALLA_BRANDS_FILE.replace(" ", "_"), SALLA_BRANDS_COL),  # ماركات_مهووس.csv
+        (SALLA_BRANDS_FILE, SALLA_BRANDS_COL),                    # ماركات مهووس.csv
+        (BRANDS_CSV_FILE,   None),                                  # brands.csv
+    ]
+    for fname, col_name in candidate_files:
+        try:
+            path = get_catalog_data_path(fname)
+            if path and pd.io.common.file_exists(path):
+                _df = pd.read_csv(path, encoding="utf-8-sig")
+                if col_name:
+                    if col_name in _df.columns:
+                        brands = [str(x).strip() for x in _df[col_name].dropna().astype(str).tolist() if str(x).strip()]
+                else:
+                    col = "اسم الماركة" if "اسم الماركة" in _df.columns else ("الاسم" if "الاسم" in _df.columns else _df.columns[0])
+                    brands = [str(x).strip() for x in _df[col].dropna().astype(str).tolist() if str(x).strip()]
+                if brands:
+                    return list(dict.fromkeys(brands))
+        except Exception:
+            continue
+    return []
+
+
+def _load_store_categories() -> list[str]:
+    """تحميل التصنيفات — يجرب عدة أسماء ملفات (مسافة / شرطة سفلية)."""
+    cats: list[str] = []
+    candidate_files = [
+        (SALLA_CATEGORIES_FILE.replace(" ", "_"), SALLA_CATEGORIES_COL),  # تصنيفات_مهووس.csv
+        (SALLA_CATEGORIES_FILE, SALLA_CATEGORIES_COL),                    # تصنيفات مهووس.csv
+        (CATEGORIES_CSV_FILE,   None),                                     # categories.csv
+    ]
+    for fname, col_name in candidate_files:
+        try:
+            path = get_catalog_data_path(fname)
+            if path and pd.io.common.file_exists(path):
+                _df = pd.read_csv(path, encoding="utf-8-sig")
+                if col_name:
+                    if col_name in _df.columns:
+                        cats = [str(x).strip() for x in _df[col_name].dropna().astype(str).tolist() if str(x).strip()]
+                else:
+                    col = "التصنيفات" if "التصنيفات" in _df.columns else ("الاسم" if "الاسم" in _df.columns else _df.columns[0])
+                    cats = [str(x).strip() for x in _df[col].dropna().astype(str).tolist() if str(x).strip()]
+                if cats:
+                    return list(dict.fromkeys(cats))
+        except Exception:
+            continue
+    return []
+
+
+def _brand_aliases(brand_label: str) -> set[str]:
+    """يبني مفاتيح مطابقة لاسم ماركة مركب مثل: عربي | English."""
+    s = str(brand_label or "").strip()
+    if not s:
+        return set()
+    parts = [p.strip() for p in re.split(r"[|/\\\-]+", s) if p.strip()]
+    keys = {_norm_brand(s)}
+    keys.update({_norm_brand(p) for p in parts})
+    return {k for k in keys if k}
+
+
+def _resolve_brand_to_store(brand_value: str, store_brands: list[str]) -> str:
+    """
+    (مطابقة صارمة): يرجع الاسم الرسمي المطابق من الكتالوج.
+    يدعم تنسيق عربي | English في ملف الماركات.
+    إذا لم يجد الماركة في ملفاتك، يرجع فارغاً لتجنب خطأ سلة.
+    """
+    import re as _re
+    bv = str(brand_value or "").strip()
+    if not bv or not store_brands:
+        return ""
+    if bv in store_brands:
+        return bv
+    target_keys = _brand_aliases(bv)
+    if not target_keys:
+        return ""
+    for sb in store_brands:
+        if target_keys & _brand_aliases(sb):
+            return sb
+    # مطابقة جزئية: هل قيمة الماركة موجودة كجزء داخل ماركة الكتالوج؟
+    bv_lower = bv.lower().strip()
+    for sb in store_brands:
+        parts = [p.strip().lower() for p in _re.split(r"[|/\\]", sb.lower()) if p.strip()]
+        if bv_lower in parts or any(bv_lower == p or bv_lower in p.split() for p in parts):
+            return sb
+    return ""  # إرجاع فارغ لمنع الرفض
+
+
+def _norm_category(s: str) -> str:
+    t = sanitize_salla_text(str(s or "")).strip().lower()
+    t = re.sub(r"[>|\-_/]", " ", t)
+    t = re.sub(r"\s+", " ", t).strip()
+    return t
+
+
+def _resolve_category_to_store(cat_value: str, store_categories: list[str], gender_hint: str = "") -> str:
+    """
+    (مطابقة صارمة): يرجع التصنيف المطابق.
+    إذا لم يجد التصنيف في ملفاتك، يرجع فارغاً لتجنب خطأ سلة.
+    """
+    cv = str(cat_value or "").strip()
+    if not store_categories:
+        return ""
+
+    if cv and cv in store_categories:
+        return cv
+
+    norm_map = {_norm_category(c): c for c in store_categories if _norm_category(c)}
+    ncv = _norm_category(cv)
+    if ncv and ncv in norm_map:
+        return norm_map[ncv]
+
+    gh = str(gender_hint or "").strip()
+    # المطابقة تعمل مع "للنساء" و"نسائي" كلاهما
+    if gh in ("للنساء", "نسائي"):
+        for c in store_categories:
+            if "نسائي" in c:
+                return c
+    elif gh in ("للرجال", "رجالي"):
+        for c in store_categories:
+            if "رجالي" in c:
+                return c
+    elif gh == "للجنسين":
+        for c in store_categories:
+            if "للجنسين" in c:
+                return c
+
+    if ncv:
+        matches = difflib.get_close_matches(ncv, list(norm_map.keys()), n=1, cutoff=0.5)
+        if matches:
+            return norm_map[matches[0]]
+
+    return "" # إرجاع فارغ لمنع الرفض
+
+
+def _concentration_ar(s: str) -> str:
+    """استخراج التركيز بالصيغة الموحّدة المعتمدة لمتجر مهووس."""
+    t = str(s or "").lower()
+    if any(x in t for x in ("extrait",)):
+        return "إكسترا دو بارفيم"
+    if any(x in t for x in ("eau de parfum", "edp", "أو دو بارفان", "بارفيوم")):
+        return "أو دو بارفيوم"
+    if any(x in t for x in ("eau de toilette", "edt")):
+        return "أو دو تواليت"
+    if any(x in t for x in ("eau de cologne", "edc")):
+        return "أو دو كولون"
+    if "parfum" in t:
+        return "بارفيم"
+    return ""
+
+
+def _brand_display(brand: str) -> str:
+    """للعرض في العنوان: يأخذ الجزء العربي إذا كان التنسيق 'عربي | English'."""
+    if not brand:
+        return ""
+    if "|" in brand:
+        parts = [p.strip() for p in brand.split("|")]
+        # إذا وُجد جزء عربي، أعده؛ وإلا الأول
+        ar_parts = [p for p in parts if re.search(r"[؀-ۿ]", p)]
+        if ar_parts:
+            return ar_parts[0]
+        return parts[0]
+    return brand.strip()
+
+
+def _build_export_title(raw_name: str, brand: str, gender: str) -> str:
+    """عنوان يبدأ بكلمة عطر مع الاحتفاظ بالاسم الإنجليزي إذا لم يوجد عربي."""
+    _sz = safe_float(re.search(r"(\d{2,4})\s*ml", str(raw_name).lower()).group(1), 0) if re.search(r"(\d{2,4})\s*ml", str(raw_name).lower()) else 0
+    size_txt = f"{int(_sz)} مل" if _sz > 0 else ""
+    conc_txt = _concentration_ar(raw_name)
+    line_txt = sanitize_salla_text(str(raw_name or "").strip())
+
+    # إزالة جميع مرادفات الماركة من اسم المنتج لتجنب التكرار
+    line_norm = _norm_brand(line_txt)
+    for _bk in sorted(_brand_aliases(brand), key=len, reverse=True):
+        if _bk:
+            line_norm = re.sub(rf"\b{re.escape(_bk)}\b", " ", line_norm, flags=re.I)
+    line_norm = re.sub(r"\s+", " ", line_norm).strip()
+
+    # محاولة استخراج النص العربي أولاً
+    line_ar = " ".join(re.findall(r"[\u0600-\u06FF]+", line_norm))
+    line_ar = sanitize_salla_text(line_ar).strip()
+
+    # إذا لم يوجد نص عربي → استخدم الاسم المنظّف (إنجليزي أو مختلط)
+    if not line_ar:
+        clean_name = re.sub(r"\b(edp|edt|edc|parfum|cologne|extrait)\b", "", line_txt, flags=re.I)
+        clean_name = re.sub(r"\b\d{2,4}\s*ml\b", "", clean_name, flags=re.I)
+        # احذف جميع مرادفات الماركة من البداية
+        for alias in sorted(_brand_aliases(brand), key=len, reverse=True):
+            if alias and clean_name.lower().startswith(alias):
+                clean_name = clean_name[len(alias):].strip()
+                break
+        line_ar = re.sub(r"\s+", " ", clean_name).strip()
+        if not line_ar:
+            line_ar = line_txt
+
+    brand_disp = _brand_display(brand)
+    pieces = ["عطر", brand_disp, line_ar, conc_txt, size_txt, gender]
+    title = " ".join([p for p in pieces if p]).strip()
+    title = re.sub(r"\s+", " ", title)
+    return title[:220]
+
 SALLA_SHAMEL_COLUMNS = [
-    "النوع ",                           # ← مسافة في النهاية (هكذا في قالب سلة)
-    "أسم المنتج",                       # ← همزة قطع — لا تبدّلها بـ "اسم"
+    "النوع ",
+    "أسم المنتج",
     "تصنيف المنتج",
     "صورة المنتج",
     "وصف صورة المنتج",
@@ -68,210 +324,9 @@ SALLA_SHAMEL_COLUMNS = [
     "[3] الاسم",
     "[3] النوع",
     "[3] القيمة",
-    "[3] الصورة / اللون",
+    "[3] الصورة / اللون"
 ]
 
-# ══════════════════════════════════════════════════════════════════════════════
-#  تحميل بيانات المرجع (مرة واحدة عند أول استدعاء — @functools.lru_cache)
-# ══════════════════════════════════════════════════════════════════════════════
-
-def _catalog_csv_path(filename: str) -> str:
-    """مسار ملف الكتالوج: DATA_DIR أولاً ثم data/ المحلية."""
-    data_dir = (os.environ.get("DATA_DIR") or "").strip()
-    if data_dir:
-        p = os.path.join(data_dir, filename)
-        if os.path.exists(p):
-            return p
-    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    return os.path.join(root, "data", filename)
-
-
-@functools.lru_cache(maxsize=1)
-def _load_valid_categories() -> list:
-    """يقرأ قائمة التصنيفات المعتمدة من categories.csv — مُخزَّنة في الذاكرة."""
-    for fname in ("تصنيفات مهووس.csv", "categories.csv"):
-        path = _catalog_csv_path(fname)
-        if not os.path.exists(path):
-            continue
-        for enc in ("utf-8-sig", "cp1256", "utf-8"):
-            try:
-                df = pd.read_csv(path, encoding=enc)
-                col = df.columns[0]
-                vals = [
-                    str(v).strip().strip('"').lstrip('\ufeff').strip()
-                    for v in df[col].dropna().tolist()
-                ]
-                vals = [v for v in vals if v and v not in ("nan", "none")]
-                if vals:
-                    _logger.info("تحميل %d تصنيف من %s (%s)", len(vals), path, enc)
-                    return vals
-            except Exception:
-                continue
-    _logger.warning("_load_valid_categories: لم يُعثر على ملف تصنيفات صالح")
-    return []
-
-
-@functools.lru_cache(maxsize=1)
-def _load_valid_brands() -> list:
-    """يقرأ قائمة الماركات المعتمدة من brands.csv — مُخزَّنة في الذاكرة."""
-    for fname in ("ماركات مهووس.csv", "brands.csv"):
-        path = _catalog_csv_path(fname)
-        if not os.path.exists(path):
-            continue
-        for enc in ("utf-8-sig", "cp1256", "utf-8"):
-            try:
-                df = pd.read_csv(path, encoding=enc)
-                col = df.columns[0]
-                vals = [
-                    str(v).strip().strip('"').lstrip('\ufeff').strip()
-                    for v in df[col].dropna().tolist()
-                ]
-                vals = [v for v in vals if v and v not in ("nan", "none")]
-                if vals:
-                    _logger.info("تحميل %d ماركة من %s (%s)", len(vals), path, enc)
-                    return vals
-            except Exception:
-                continue
-    _logger.warning("_load_valid_brands: لم يُعثر على ملف ماركات صالح")
-    return []
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-#  منطق المطابقة الذكية للتصنيفات
-# ══════════════════════════════════════════════════════════════════════════════
-
-# خريطة حتمية: (جنس، نوع_المنتج_lowercase) → كلمة بحث
-_CAT_RULE_MAP = [
-    # --- شعر ---
-    (None,      "hair_mist",    "عطور الشعر"),
-    (None,      "hair mist",    "عطور الشعر"),
-    (None,      "شعر",          "عطور الشعر"),
-    # --- جسم ---
-    (None,      "body_mist",    "عطور الجسم"),
-    (None,      "body mist",    "عطور الجسم"),
-    (None,      "جسم",          "عطور الجسم"),
-    (None,      "بودي",         "عطور الجسم"),
-    # --- تستر ---
-    (None,      "تستر",         "عطور التستر"),
-    (None,      "tester",       "عطور التستر"),
-    # --- نيش ---
-    (None,      "نيش",          "عطور النيش"),
-    (None,      "niche",        "عطور النيش"),
-    # --- بدائل ---
-    (None,      "بديل",         "بدائل العطور"),
-    (None,      "dupe",         "بدائل العطور"),
-    # --- فرمونية ---
-    (None,      "فرمون",        "عطور فرمونية"),
-    (None,      "pheromon",     "عطور فرمونية"),
-    # --- أطفال ---
-    (None,      "أطفال",        "عطور الأطفال"),
-    (None,      "اطفال",        "عطور الأطفال"),
-    (None,      "kids",         "عطور الأطفال"),
-    (None,      "children",     "عطور الأطفال"),
-    # --- بيونا جنس ---
-    ("رجالي",   "",             "عطور رجالية"),
-    ("رجال",    "",             "عطور رجالية"),
-    ("للرجال",  "",             "عطور رجالية"),
-    ("men",     "",             "عطور رجالية"),
-    ("homme",   "",             "عطور رجالية"),
-    ("male",    "",             "عطور رجالية"),
-    ("نسائي",   "",             "عطور نسائية"),
-    ("نساء",    "",             "عطور نسائية"),
-    ("للنساء",  "",             "عطور نسائية"),
-    ("women",   "",             "عطور نسائية"),
-    ("femme",   "",             "عطور نسائية"),
-    ("female",  "",             "عطور نسائية"),
-]
-
-_CAT_FALLBACK = "العطور"
-
-
-def _best_category_from_rules(product_name: str, gender: str, ptype: str) -> str:
-    """
-    يطابق حتمياً أولاً، ثم بـ rapidfuzz.
-    يُرجع دائماً قيمة صالحة (لا None).
-    """
-    valid = _load_valid_categories()
-    s_name   = str(product_name or "").lower()
-    s_gender = str(gender  or "").lower()
-    s_type   = str(ptype   or "").lower()
-    combined = f"{s_name} {s_gender} {s_type}"
-
-    # ── مرحلة 1: قواعد حتمية ──────────────────────────────────────────────
-    for gender_kw, type_kw, search_term in _CAT_RULE_MAP:
-        if gender_kw and gender_kw.lower() not in combined:
-            continue
-        if type_kw and type_kw.lower() not in combined:
-            continue
-        # ابحث عن search_term في قائمة التصنيفات الفعلية
-        if not valid:
-            return search_term  # لا توجد قائمة — أعد الكلمة مباشرةً
-        # مطابقة مباشرة أولاً
-        for v in valid:
-            if v == search_term or v.startswith(search_term):
-                return v
-        # ثم fuzzy
-        try:
-            from rapidfuzz import process as rf_proc, fuzz as rf_fuzz
-            hit = rf_proc.extractOne(search_term, valid, scorer=rf_fuzz.token_set_ratio)
-            if hit and hit[1] >= 55:
-                return hit[0]
-        except ImportError:
-            pass
-        return search_term  # fallback على الكلمة مباشرةً
-
-    # ── مرحلة 2: fuzzy مفتوح على الاسم كاملاً ─────────────────────────────
-    if valid:
-        try:
-            from rapidfuzz import process as rf_proc, fuzz as rf_fuzz
-            hit = rf_proc.extractOne(combined, valid, scorer=rf_fuzz.token_set_ratio)
-            if hit and hit[1] >= 45:
-                return hit[0]
-        except ImportError:
-            pass
-        # الفئة الأم الافتراضية
-        for v in valid:
-            if v == _CAT_FALLBACK:
-                return v
-        return valid[0]
-
-    return _CAT_FALLBACK  # Hard Rule: لا تُرجع فارغاً أبداً
-
-
-def _best_brand_from_csv(raw_brand: str) -> str:
-    """
-    يُرجع الاسم الحرفي للماركة من brands.csv (نسخ حرفي).
-    إذا لم تُوجد مطابقة ≥ 75% → يُعيد raw_brand كما هو.
-    Hard Rule: لا تُرجع فارغاً أبداً — القيمة الافتراضية "غير محدد".
-    """
-    raw = str(raw_brand or "").strip()
-    if not raw or raw.lower() in ("nan", "none", ""):
-        return "غير محدد"          # ← Hard Rule
-    valid = _load_valid_brands()
-    if not valid:
-        return raw
-    # مطابقة مباشرة أولاً
-    for v in valid:
-        if raw.lower() == v.lower():
-            return v
-        # المقارنة بعد الـ | (الاسم الإنجليزي)
-        parts = [p.strip() for p in v.split("|")]
-        if any(raw.lower() == p.lower() for p in parts):
-            return v
-    # ثم fuzzy
-    try:
-        from rapidfuzz import process as rf_proc, fuzz as rf_fuzz
-        hit = rf_proc.extractOne(raw, valid, scorer=rf_fuzz.token_set_ratio)
-        if hit and hit[1] >= 75:
-            return hit[0]
-    except ImportError:
-        pass
-    return raw  # لا مطابقة — أبقِ الاسم الأصلي
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-#  دوال تنظيف البيانات
-# ══════════════════════════════════════════════════════════════════════════════
 
 def _strip_html_visible(s: str) -> str:
     if not s:
@@ -281,238 +336,190 @@ def _strip_html_visible(s: str) -> str:
     return re.sub(r"\s+", " ", t).strip()
 
 
-def _is_url(s: str) -> bool:
+def _is_url_text(s: str) -> bool:
     t = str(s or "").strip().lower()
     return t.startswith("http://") or t.startswith("https://")
 
 
-def _single_image_url(raw: str) -> str:
-    """
-    يُرجع رابط صورة واحد نظيف — لا فراغات، لا روابط متعددة.
-    يقطع عند أول رابط ثانٍ حتى لو كان CDN.
-    """
-    s = str(raw or "").strip()
-    if not s:
-        return ""
-    # إزالة أي بيانات base64
-    if s.startswith("data:"):
-        return ""
-    # قطع عند بداية أي رابط ثانٍ (https:// أو http:// بعد الحرف 8)
-    idx_http  = s.find("http://", 8)
-    idx_https = s.find("https://", 8)
-    candidates = [i for i in (idx_http, idx_https) if i > 0]
-    if candidates:
-        cut = min(candidates)
-        s = s[:cut].rstrip(",،. \t\n\r")
-    # استخراج أول URL نظيف (بدون مسافة أو اقتباسات)
-    m = re.search(
-        r"(https?://[^\s<>\"',\u060c؛;]+?\.(?:webp|jpg|jpeg|png|gif|avif)(?:[?#][^\s<>\"',]*)?)",
-        s, re.I,
-    )
-    if m:
-        return m.group(1).rstrip(".,;)>]")
-    m2 = re.search(r"(https?://[^\s\"'<>,،]+)", s)
-    return m2.group(1).rstrip(".,;)>]") if m2 else ""
+def _plain_missing_product_name(r: dict) -> str:
+    for key in ("المنتج", "اسم المنتج", "اسم_المنتج", "Product", "Name", "name", "title", "الاسم", "منتج_المنافس", "أسم المنتج"):
+        v = r.get(key)
+        if v and not _is_url_text(v):
+            return sanitize_salla_text(str(v))
+    return "منتج عطر"
 
 
-def _plain_name(r: dict) -> str:
-    """اسم منتج نصي — لا HTML ولا رابط خام."""
-    def _clean(v):
-        x = _strip_html_visible(str(v or "").strip())
-        return "" if (not x or x.lower() in ("nan", "none", "<na>")) else x
-
-    for key in ("المنتج", "اسم المنتج", "اسم_المنتج", "منتج_المنافس",
-                "Product", "Name", "name", "title", "الاسم"):
-        v = _clean(r.get(key))
-        if v and not _is_url(v):
-            return v
-    # بناء من الحقول الوصفية
-    chunks = [c for c in (_clean(r.get("الماركة")), _clean(r.get("الحجم")), _clean(r.get("النوع"))) if c]
-    return " · ".join(chunks) if chunks else ""
+def _contains_arabic(s: str) -> bool:
+    return bool(re.search(r"[\u0600-\u06FF]", str(s or "")))
 
 
-def _extract_price(r: dict) -> float:
-    for k in ("سعر_المنافس", "سعر المنافس", "السعر", "سعر المنتج", "Price", "price"):
+def _infer_gender_text(r: dict) -> str:
+    raw = " ".join([
+        str(r.get("الجنس", "")),
+        str(r.get("نوع المنتج", "")),
+        str(r.get("منتج_المنافس", "")),
+        str(r.get("المنتج", "")),
+        str(r.get("أسم المنتج", "")),
+    ]).lower()
+    if any(x in raw for x in ("نسائي", "نساء", "للنساء", "women", "female", "lady", "pour femme")):
+        return "للنساء"
+    if any(x in raw for x in ("رجالي", "رجال", "للرجال", "men", "male", "homme", "pour homme")):
+        return "للرجال"
+    if any(x in raw for x in ("للجنسين", "unisex", "الجنسين")):
+        return "للجنسين"
+    return ""
+
+
+def _safe_alt_text(s: str) -> str:
+    t = sanitize_salla_text(_strip_html_visible(s or "")).strip()
+    t = _ALT_SAFE_RE.sub(" ", t)
+    t = re.sub(r"\s+", " ", t).strip()
+    return t[:180]
+
+
+def _real_price(r: dict) -> str:
+    for k in ("سعر_المنافس", "سعر المنافس", "السعر", "سعر المنتج", "Price", "price", "PRICE"):
+        if k not in r: continue
         p = safe_float(r.get(k), 0.0)
-        if p > 0:
-            return round(p, 2)
-    return 0.0
+        if p > 0: return str(round(p, 2))
+    return ""
 
 
-def _extract_sku(r: dict, pname: str = "") -> str:
-    """
-    يستخرج SKU من الصف ويُنظّفه عبر sanitize_sku.
-    يُمنع وضع روابط URL مباشرةً — يُحوَّل الرابط لرمز فريد.
-    """
-    from utils.data_helpers import sanitize_sku as _sanitize_sku
-
-    for k in ("معرف_المنافس", "رمز المنتج sku", "رمز_المنتج_sku",
-              "SKU", "sku", "رمز المنتج", "رقم المنتج", "Barcode", "barcode"):
+def _real_sku(r: dict) -> str:
+    for k in ("معرف_المنافس", "رمز المنتج sku", "رمز_المنتج_sku", "SKU", "sku", "Sku", "رمز المنتج", "رمز_المنتج", "رقم المنتج", "Barcode", "barcode", "الباركود", "الكود", "كود", "Code", "code"):
         v = r.get(k)
-        if v is None or (isinstance(v, float) and pd.isna(v)):
-            continue
+        if v is None or (isinstance(v, float) and pd.isna(v)): continue
         s = str(v).strip()
-        if not s or s.lower() in ("nan", "none", "<na>"):
-            continue
-        # sanitize_sku يتعامل مع الرابط والرقم والنص
-        return _sanitize_sku(s, pname=pname)
-
-    # إذا لم يُوجد حقل SKU → حاول الاشتقاق من رابط المنتج
-    for url_k in ("رابط_المنافس", "رابط المنتج", "product_url", "url"):
-        u = str(r.get(url_k) or "").strip()
-        if u.startswith("http"):
-            return _sanitize_sku(u, pname=pname)
-
-    # Last Resort: توليد MSNG hash من اسم المنتج — لا تُرجع فارغاً أبداً
-    # سلة ترفض أي صف بدون SKU → هذا السطر يضمن القبول 100%
-    return _sanitize_sku("", pname=pname)
+        if not s or s.lower() in ("nan", "none", "<na>") or s.startswith("http"): continue
+        return s
+    return ""
 
 
-def _extract_weight(r: dict) -> tuple:
-    w = safe_float(r.get("الوزن"), 0.0)
-    unit = str(r.get("وحدة الوزن") or r.get("weight_unit") or "").strip()
-    return (round(max(w, 0.2), 4), unit or "kg")
-
-
-def _placeholder_description(name: str, brand: str) -> str:
-    return (
-        f"عطر أصلي 100% — {name}{' — ' + brand if brand else ''}. "
-        f"متوفر لدى متجر مهووس للعطور. "
-        f"استخدم زر «خبير الوصف» في صفحة المفقودات لتوليد وصف تسويقي كامل."
-    )
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-#  الدالة الرئيسية — التصدير
-# ══════════════════════════════════════════════════════════════════════════════
-
-def export_to_salla_shamel(
-    missing_df: pd.DataFrame,
-    generate_descriptions: bool = False,
-) -> bytes:
-    """
-    يُنشئ ملف CSV جاهزاً لاستيراد سلة الشامل.
-
-    الهيكل:
-        الصف 1 : «بيانات المنتج» + أعمدة فارغة (مطلوب من سلة)
-        الصف 2 : رؤوس الأعمدة (SALLA_SHAMEL_COLUMNS)
-        الصف 3+ : البيانات
-
-    الترميز: UTF-8 مع BOM ← Excel وسلة يقرأانه صحيحاً.
-    """
+def export_to_salla_shamel(missing_df: pd.DataFrame, generate_descriptions: bool = True) -> bytes:
     ncols = len(SALLA_SHAMEL_COLUMNS)
-    buf   = io.StringIO(newline="")
-    writer = csv.writer(buf, quoting=csv.QUOTE_MINIMAL)
-
-    # صف الترويسة الذي تطلبه سلة
-    writer.writerow(["بيانات المنتج"] + [""] * (ncols - 1))
-    writer.writerow(SALLA_SHAMEL_COLUMNS)
 
     if missing_df is None or missing_df.empty:
-        return ("\ufeff" + buf.getvalue()).encode("utf-8")
+        out = io.StringIO(newline="")
+        w = csv.writer(out)
+        w.writerow(["﻿بيانات المنتج"] + [""] * (ncols - 1))
+        w.writerow(SALLA_SHAMEL_COLUMNS)
+        return ("\ufeff" + out.getvalue()).encode("utf-8")
 
-    for idx, row in missing_df.iterrows():
+    rows_out = []
+    _store_brands = _load_store_brands()
+    _store_categories = _load_store_categories()
+    
+    _seen_skus: set[str] = set()
+    for _, row in missing_df.iterrows():
         r = row.to_dict()
+        raw_pname = _plain_missing_product_name(r)
+        gender_inferred = _infer_gender_text(r)
+        comp_price = _real_price(r)
+        
+        # 1. الماركة - مطابقة صارمة
+        brand_raw = sanitize_salla_text(
+            str(r.get("الماركة_الرسمية", "") or r.get("الماركة", "")).strip()
+        )
+        if brand_raw in ("", "ماركة عالمية", "Unknown", "unknown"):
+            brand_raw = ""
+        # مطابقة مرنة أولاً ثم المطابق الصارم احتياطاً
+        brand = get_brand_arabic_name(brand_raw, _store_brands) if brand_raw else ""
+        if not brand and brand_raw:
+            brand = _resolve_brand_to_store(brand_raw, _store_brands)
+        
+        pname = _build_export_title(raw_pname, brand, gender_inferred)
 
-        # ── الاسم ─────────────────────────────────────────────────────────
-        pname = _plain_name(r)
-        if not pname:
-            pname = _strip_html_visible(str(r.get("منتج_المنافس", "") or "")) or "منتج"
+        # فحص الحجم المفقود — علامة ⚠️ للمراجعة اليدوية
+        _size_check = extract_size_ml(raw_pname)
+        if not _size_check and "مل" not in pname:
+            pname = "⚠️ " + pname
 
-        # ── السعر ─────────────────────────────────────────────────────────
-        comp_price = _extract_price(r)
-        list_price = comp_price if comp_price > 0 else 1.0
-
-        # ── البيانات الوصفية ───────────────────────────────────────────────
-        brand  = str(r.get("الماركة",  "") or "").strip()
-        gender = str(r.get("الجنس",    "") or "").strip()
-        ptype  = str(r.get("النوع",    "") or "").strip()
-        sku    = _extract_sku(r, pname=pname)
-        w_val, w_unit = _extract_weight(r)
-
-        # ── الصورة — رابط واحد نظيف ────────────────────────────────────────
-        raw_img = str(r.get("صورة_المنافس", "") or r.get("image_url", "") or "").strip()
-        img     = _single_image_url(raw_img)
-
-        # ── التصنيف — من ملف سلة الرسمي ─────────────────────────────────
-        # أولوية: عمود "تصنيف_سلة_الدقيق" (إن وُلِّد مسبقاً) ثم الاستنتاج الذكي
-        preset_cat = str(r.get("تصنيف_سلة_الدقيق", "") or "").strip()
-        if preset_cat and preset_cat not in ("nan", "none"):
-            category = preset_cat
-        else:
-            category = _best_category_from_rules(pname, gender, ptype)
-
-        # ── الماركة — من ملف سلة الرسمي ──────────────────────────────────
-        preset_brand = str(r.get("الماركة_المعتمدة", "") or "").strip()
-        if preset_brand and preset_brand not in ("nan", "none"):
-            brand_out = preset_brand
-        else:
-            brand_out = _best_brand_from_csv(brand) if brand else ""
-
-        # ── الوصف — HTML نقي (لا Markdown) ──────────────────────────────
-        # أولوية 1: الوصف الآلي المولَّد مسبقاً (من زر الصفحة)
-        preset_desc = str(r.get("الوصف_الآلي", "") or "").strip()
-        if preset_desc and preset_desc not in ("nan", "none"):
-            desc_text = preset_desc
-        elif generate_descriptions:
-            try:
-                from engines.ai_engine import generate_salla_html_description
-                raw_scraped = str(r.get("raw_description", "") or "").strip()
-                desc_text = generate_salla_html_description(pname, raw_scraped)
-            except Exception as _e:
-                _logger.warning("generate_salla_html_description فشل للمنتج '%s': %s", pname, _e)
-                desc_text = _placeholder_description(pname, brand_out)
-        else:
-            desc_text = _placeholder_description(pname, brand_out)
-
-        alt_txt = f"زجاجة عطر {pname} الأصلية"
-        promo   = f"{pname} — {brand_out}".strip(" —")
-
-        # ── بناء الصف بالترتيب الحرفي للأعمدة ────────────────────────────
-        row_map = {
-            "النوع ":                        "منتج",        # ← مسافة في المفتاح
-            "أسم المنتج":                    pname,
-            "تصنيف المنتج":                  category,
-            "صورة المنتج":                   img,
-            "وصف صورة المنتج":               alt_txt,
-            "نوع المنتج":                    "منتج جاهز",   # ← ثابت
-            "سعر المنتج":                    list_price,
-            "الوصف":                         desc_text,
-            "هل يتطلب شحن؟":                "نعم",          # ← ثابت
-            "رمز المنتج sku":                sku,
-            "سعر التكلفة":                   "",
-            "السعر المخفض":                  "",
-            "تاريخ بداية التخفيض":           "",
-            "تاريخ نهاية التخفيض":           "",
-            "اقصي كمية لكل عميل":           "",
-            "إخفاء خيار تحديد الكمية":      "",
-            "اضافة صورة عند الطلب":         "",
-            "الوزن":                         w_val,
-            "وحدة الوزن":                    w_unit,
-            "الماركة":                       brand_out,
-            "العنوان الترويجي":              promo[:250],
-            "تثبيت المنتج":                  "",
-            "الباركود":                      str(r.get("الباركود") or r.get("Barcode") or "").strip(),
-            "السعرات الحرارية":              "",
-            "MPN":                           "",
-            "GTIN":                          "",
-            "خاضع للضريبة ؟":               "نعم",          # ← ثابت
-            "سبب عدم الخضوع للضريبة":       "",
-            "[1] الاسم":                     "",
-            "[1] النوع":                     "",
-            "[1] القيمة":                    "",
-            "[1] الصورة / اللون":            "",
-            "[2] الاسم":                     "",
-            "[2] النوع":                     "",
-            "[2] القيمة":                    "",
-            "[2] الصورة / اللون":            "",
-            "[3] الاسم":                     "",
-            "[3] النوع":                     "",
-            "[3] القيمة":                    "",
-            "[3] الصورة / اللون":            "",
+        # 2. رمز المنتج (SKU) - منع التكرار
+        img = str(r.get("صورة_المنافس", r.get("image_url", ""))).strip()
+        sku_raw = _real_sku(r)
+        sku = sanitize_salla_text(str(sku_raw or "").strip())
+        _sku_invalid = (not sku) or ("/" in sku) or ("http" in sku.lower()) or (sku in _seen_skus)
+        if _sku_invalid:
+            sku = f"MS-{uuid.uuid4().hex[:10].upper()}"
+        _seen_skus.add(sku)
+        
+        # 3. الوصف
+        product_data = {
+            "name": pname,
+            "brand": brand,
+            "description": str(r.get("الوصف", "")),
+            "notes": {
+                "top": str(r.get("الافتتاحية", r.get("top_notes", ""))),
+                "heart": str(r.get("القلب", r.get("heart_notes", ""))),
+                "base": str(r.get("القاعدة", r.get("base_notes", "")))
+            }
         }
+        desc_text = format_mahwous_description(product_data)
+        
+        # 4. التصنيف - مطابقة صارمة
+        category_raw = sanitize_salla_text(
+            str(r.get("التصنيف_الرسمي", "") or r.get("تصنيف المنتج", "")).strip()
+        )
+        if not category_raw:
+            category_raw = auto_infer_category(pname, str(r.get("الجنس", "")))
+            
+        category = _resolve_category_to_store(category_raw, _store_categories, gender_inferred)
+        
+        alt_txt = _safe_alt_text(f"صورة {pname}")
 
-        writer.writerow([row_map[col] for col in SALLA_SHAMEL_COLUMNS])
+        # ── الوصف: لا نستخدم sanitize_salla_text لأنها تحذف وسوم HTML ──
+        raw_ai_desc = str(r.get("وصف_AI", "") or "").strip()
+        if raw_ai_desc:
+            # إذا كان الوصف بصيغة Markdown (يحتوي ## أو ###) حوّله إلى HTML
+            if "##" in raw_ai_desc or "\n### " in raw_ai_desc or "\n## " in raw_ai_desc:
+                final_desc = _markdown_to_salla_html(raw_ai_desc)
+            else:
+                # وصف HTML جاهز: نظّفه بدون حذف وسوم HTML
+                final_desc = raw_ai_desc.strip()
+            final_desc = sanitize_description_terms(final_desc)
+        else:
+            final_desc = desc_text  # fallback: HTML من format_mahwous_description
 
-    # UTF-8 مع BOM
+        row_csv = {
+            "النوع ": "منتج",
+            "أسم المنتج": pname,
+            "تصنيف المنتج": category,
+            "صورة المنتج": img,
+            "وصف صورة المنتج": alt_txt,
+            "نوع المنتج": "منتج جاهز",
+            "سعر المنتج": comp_price,
+            "الوصف": final_desc,
+            "هل يتطلب شحن؟": "نعم",
+            "رمز المنتج sku": sku,
+            "سعر التكلفة": "",
+            "السعر المخفض": "",
+            "تاريخ بداية التخفيض": "",
+            "تاريخ نهاية التخفيض": "",
+            "اقصي كمية لكل عميل": "1",
+            "إخفاء خيار تحديد الكمية": "لا",
+            "اضافة صورة عند الطلب": "لا",
+            "الوزن": "0.2",
+            "وحدة الوزن": "kg",
+            "الماركة": brand,
+            "العنوان الترويجي": "",
+            "تثبيت المنتج": "",
+            "الباركود": "",
+            "السعرات الحرارية": "",
+            "MPN": "",
+            "GTIN": "",
+            "خاضع للضريبة ؟": "نعم",
+            "سبب عدم الخضوع للضريبة": "",
+            "[1] الاسم": "", "[1] النوع": "", "[1] القيمة": "", "[1] الصورة / اللون": "",
+            "[2] الاسم": "", "[2] النوع": "", "[2] القيمة": "", "[2] الصورة / اللون": "",
+            "[3] الاسم": "", "[3] النوع": "", "[3] القيمة": "", "[3] الصورة / اللون": "",
+        }
+        rows_out.append([row_csv.get(c, "") for c in SALLA_SHAMEL_COLUMNS])
+
+    buf = io.StringIO(newline="")
+    writer = csv.writer(buf)
+    writer.writerow(["﻿بيانات المنتج"] + [""] * (ncols - 1))
+    writer.writerow(SALLA_SHAMEL_COLUMNS)
+    for line in rows_out:
+        writer.writerow(line)
+    
     return ("\ufeff" + buf.getvalue()).encode("utf-8")
