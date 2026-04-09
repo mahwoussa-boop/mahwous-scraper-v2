@@ -1,446 +1,403 @@
 """
-utils/helpers.py — دوال مساعدة محسّنة لمعالجة البيانات والفلاتر والتصدير
-════════════════════════════════════════════════════════════════════════════
-✅ معالجة آمنة للبيانات الفارغة والمفقودة
-✅ فلاتر ذكية تتعامل مع جميع الأعمدة
-✅ تصدير Excel متقدم مع دعم البادئات
-✅ توافق كامل مع جميع استدعاءات app.py
+utils/helpers.py - دوال مساعدة v17.2
+الملف الذي كان مفقوداً - يحتوي على جميع الدوال المستوردة في app.py
 """
-import pandas as pd
+import html as html_std
 import io
 import re
-from typing import Dict, List, Any, Optional, Tuple
+from typing import Optional, Dict, List
+from urllib.parse import urlparse
+
+import pandas as pd
+import requests
 
 
-# ════════════════════════════════════════════════════════════════════════════
-# دوال تحويل البيانات (Data Conversion)
-# ════════════════════════════════════════════════════════════════════════════
+# ===== safe_float =====
+_AR_DIGIT_TABLE = str.maketrans('٠١٢٣٤٥٦٧٨٩', '0123456789')
 
-def safe_float(val):
-    """تحويل القيمة إلى رقم عشري بأمان"""
+def safe_float(val, default=0.0) -> float:
+    """تحويل قيمة إلى float بأمان — يدعم الأرقام العربية والفواصل ورموز العملة."""
     try:
-        if pd.isna(val) or val is None:
-            return 0.0
+        if val is None or val == "" or (isinstance(val, float) and pd.isna(val)):
+            return default
         if isinstance(val, (int, float)):
             return float(val)
-        # إزالة العملة والرموز
-        s = str(val).replace('ر.س', '').replace('SR', '').replace(',', '').strip()
-        return float(re.sub(r'[^\d.]', '', s))
-    except:
-        return 0.0
+        s = str(val).strip()
+        # ترجمة الأرقام العربية-الهندية
+        s = s.translate(_AR_DIGIT_TABLE)
+        # إزالة رموز العملة والمسافات، الإبقاء على الأرقام والفاصلتين فقط
+        s = re.sub(r'[^\d.,-]', '', s)
+        # إزالة الفاصلة كفاصل آلاف (السياق: أسعار ريال سعودي)
+        s = s.replace(',', '')
+        return float(s) if s else default
+    except (ValueError, TypeError):
+        return default
 
 
-def format_price(val):
-    """تنسيق السعر للعرض"""
+# ===== format_price =====
+def format_price(price, currency="ر.س") -> str:
+    """تنسيق عرض السعر"""
     try:
-        return f"{safe_float(val):,.2f} ر.س"
+        return f"{float(price):,.0f} {currency}"
     except:
-        return "0.00 ر.س"
+        return f"0 {currency}"
 
 
-def format_diff(val):
-    """تنسيق فرق السعر"""
+# ===== format_diff =====
+def format_diff(diff) -> str:
+    """تنسيق عرض فرق السعر"""
     try:
-        val = safe_float(val)
-        if val > 0:
-            return f"+{val:,.2f} ر.س"
-        return f"{val:,.2f} ر.س"
+        d = float(diff)
+        sign = "+" if d > 0 else ""
+        return f"{sign}{d:,.0f} ر.س"
     except:
-        return "0.00 ر.س"
+        return "0 ر.س"
 
 
-# ════════════════════════════════════════════════════════════════════════════
-# دوال الفلترة (Filtering)
-# ════════════════════════════════════════════════════════════════════════════
-
-def apply_filters(df: pd.DataFrame, filters: Dict[str, Any]) -> pd.DataFrame:
-    """
-    تطبيق الفلاتر على DataFrame
-    
-    Args:
-        df: البيانات الأصلية
-        filters: قاموس يحتوي على الفلاتر (search, brand, competitor, type, match_min, price_min, price_max)
-    
-    Returns:
-        DataFrame مع تطبيق الفلاتر
-    """
-    if df is None or df.empty:
-        return df
-    
-    try:
-        filtered_df = df.copy()
-        
-        # فلتر البحث (Search)
-        if filters.get("search"):
-            search_term = str(filters["search"]).lower()
-            # البحث في جميع الأعمدة النصية
-            mask = filtered_df.astype(str).apply(
-                lambda row: row.str.contains(search_term, case=False, na=False).any(), 
-                axis=1
-            )
-            filtered_df = filtered_df[mask]
-        
-        # فلتر الماركة (Brand)
-        if filters.get("brand") and filters["brand"] != "الكل":
-            brand_cols = [col for col in filtered_df.columns if 'ماركة' in col or 'brand' in col.lower()]
-            if brand_cols:
-                filtered_df = filtered_df[filtered_df[brand_cols[0]].astype(str) == str(filters["brand"])]
-        
-        # فلتر المنافس (Competitor)
-        if filters.get("competitor") and filters["competitor"] != "الكل":
-            comp_cols = [col for col in filtered_df.columns if 'منافس' in col or 'competitor' in col.lower()]
-            if comp_cols:
-                filtered_df = filtered_df[filtered_df[comp_cols[0]].astype(str) == str(filters["competitor"])]
-        
-        # فلتر النوع (Type)
-        if filters.get("type") and filters["type"] != "الكل":
-            type_cols = [col for col in filtered_df.columns if 'نوع' in col or 'type' in col.lower() or 'فئة' in col or 'category' in col.lower()]
-            if type_cols:
-                filtered_df = filtered_df[filtered_df[type_cols[0]].astype(str) == str(filters["type"])]
-        
-        # فلتر الحد الأدنى للتطابق (Match Min)
-        if filters.get("match_min") and filters["match_min"] > 0:
-            match_cols = [col for col in filtered_df.columns if 'تطابق' in col or 'match' in col.lower()]
-            if match_cols:
-                filtered_df = filtered_df[filtered_df[match_cols[0]].apply(safe_float) >= filters["match_min"]]
-        
-        # فلتر السعر الأدنى (Price Min)
-        if filters.get("price_min") and filters["price_min"] > 0:
-            price_cols = [col for col in filtered_df.columns if 'السعر' in col or 'price' in col.lower()]
-            if price_cols:
-                filtered_df = filtered_df[filtered_df[price_cols[0]].apply(safe_float) >= filters["price_min"]]
-        
-        # فلتر السعر الأقصى (Price Max)
-        if filters.get("price_max") and filters["price_max"] > 0:
-            price_cols = [col for col in filtered_df.columns if 'السعر' in col or 'price' in col.lower()]
-            if price_cols:
-                filtered_df = filtered_df[filtered_df[price_cols[0]].apply(safe_float) <= filters["price_max"]]
-        
-        return filtered_df
-    
-    except Exception as e:
-        return df
-
-
-def get_filter_options(df: pd.DataFrame) -> Dict[str, List]:
-    """
-    الحصول على خيارات الفلترة من جميع الأعمدة المتاحة
-    
-    Args:
-        df: DataFrame للحصول على الخيارات منه
-    
-    Returns:
-        قاموس يحتوي على:
-        - brands: قائمة الماركات الفريدة
-        - competitors: قائمة المنافسين الفريدة
-        - types: قائمة الأنواع الفريدة
-    """
-    options = {
+# ===== get_filter_options =====
+def get_filter_options(df: pd.DataFrame) -> dict:
+    """استخراج خيارات الفلاتر من DataFrame"""
+    opts = {
         "brands": ["الكل"],
         "competitors": ["الكل"],
-        "types": ["الكل"]
+        "types": ["الكل"],
     }
-    
     if df is None or df.empty:
-        return options
-    
-    try:
-        # البحث عن أعمدة الماركات (بأسماء مختلفة محتملة)
-        brand_cols = [col for col in df.columns if 'ماركة' in col or 'brand' in col.lower() or 'العلامة' in col]
-        if brand_cols:
-            col = brand_cols[0]
-            brands = sorted([str(x) for x in df[col].dropna().unique() if x and str(x) != 'nan'])
-            options["brands"] = ["الكل"] + brands
-        
-        # البحث عن أعمدة المنافسين
-        comp_cols = [col for col in df.columns if 'منافس' in col or 'competitor' in col.lower() or 'المنافس' in col]
-        if comp_cols:
-            col = comp_cols[0]
-            competitors = sorted([str(x) for x in df[col].dropna().unique() if x and str(x) != 'nan'])
-            options["competitors"] = ["الكل"] + competitors
-        
-        # البحث عن أعمدة النوع
-        type_cols = [col for col in df.columns if 'نوع' in col or 'type' in col.lower() or 'فئة' in col or 'category' in col.lower()]
-        if type_cols:
-            col = type_cols[0]
-            types = sorted([str(x) for x in df[col].dropna().unique() if x and str(x) != 'nan'])
-            options["types"] = ["الكل"] + types
-    
-    except Exception as e:
-        pass
-    
-    return options
+        return opts
+
+    # الماركات
+    if "الماركة" in df.columns:
+        brands = df["الماركة"].dropna().unique().tolist()
+        brands = sorted([str(b) for b in brands if str(b).strip() and str(b) != "nan"])
+        opts["brands"] = ["الكل"] + brands
+
+    # المنافسون
+    if "المنافس" in df.columns:
+        comps = df["المنافس"].dropna().unique().tolist()
+        comps = sorted([str(c) for c in comps if str(c).strip() and str(c) != "nan"])
+        opts["competitors"] = ["الكل"] + comps
+
+    # الأنواع
+    if "النوع" in df.columns:
+        types = df["النوع"].dropna().unique().tolist()
+        types = sorted([str(t) for t in types if str(t).strip() and str(t) != "nan"])
+        opts["types"] = ["الكل"] + types
+
+    return opts
 
 
-# ════════════════════════════════════════════════════════════════════════════
-# دوال التصدير (Export)
-# ════════════════════════════════════════════════════════════════════════════
+# ===== apply_filters =====
+def apply_filters(df: pd.DataFrame, filters: dict) -> pd.DataFrame:
+    """تطبيق الفلاتر على DataFrame"""
+    if df is None or df.empty:
+        return df
 
-def export_to_excel(df: pd.DataFrame, prefix: str = "export") -> bytes:
+    result = df.copy()
+
+    # بحث نصي
+    search = filters.get("search", "").strip()
+    if search:
+        mask = pd.Series([False] * len(result))
+        for col in ["المنتج", "منتج_المنافس", "الماركة"]:
+            if col in result.columns:
+                mask = mask | result[col].astype(str).str.contains(search, case=False, na=False)
+        result = result[mask]
+
+    # فلتر الماركة
+    brand = filters.get("brand", "الكل")
+    if brand and brand != "الكل" and "الماركة" in result.columns:
+        result = result[result["الماركة"].astype(str) == brand]
+
+    # فلتر المنافس
+    competitor = filters.get("competitor", "الكل")
+    if competitor and competitor != "الكل" and "المنافس" in result.columns:
+        result = result[result["المنافس"].astype(str) == competitor]
+
+    # فلتر النوع
+    ptype = filters.get("type", "الكل")
+    if ptype and ptype != "الكل" and "النوع" in result.columns:
+        result = result[result["النوع"].astype(str) == ptype]
+
+    # فلتر نسبة التطابق
+    match_min = filters.get("match_min")
+    if match_min and "نسبة_التطابق" in result.columns:
+        result = result[result["نسبة_التطابق"] >= float(match_min)]
+
+    # فلتر أقل سعر
+    price_min = filters.get("price_min", 0.0)
+    if price_min and price_min > 0 and "السعر" in result.columns:
+        result = result[result["السعر"] >= float(price_min)]
+
+    # فلتر أعلى سعر
+    price_max = filters.get("price_max")
+    if price_max and price_max > 0 and "السعر" in result.columns:
+        result = result[result["السعر"] <= float(price_max)]
+
+    return result.reset_index(drop=True)
+
+
+# ===== export_to_excel =====
+def export_to_excel(df: pd.DataFrame, sheet_name: str = "النتائج") -> bytes:
+    """تصدير DataFrame إلى Excel"""
+    output = io.BytesIO()
+    export_df = df.copy()
+
+    # إزالة الأعمدة غير القابلة للتسلسل
+    for col in ["جميع المنافسين", "جميع_المنافسين"]:
+        if col in export_df.columns:
+            export_df = export_df.drop(columns=[col])
+
+    safe_name = sheet_name[:31]
+    with pd.ExcelWriter(output, engine='openpyxl') as writer:
+        export_df.to_excel(writer, sheet_name=safe_name, index=False)
+
+        # تنسيق العمود
+        ws = writer.sheets[safe_name]
+        for col in ws.columns:
+            max_len = max(len(str(cell.value or "")) for cell in col)
+            ws.column_dimensions[col[0].column_letter].width = min(max_len + 4, 50)
+
+    return output.getvalue()
+
+
+# ===== export_multiple_sheets =====
+def export_multiple_sheets(sheets: Dict[str, pd.DataFrame]) -> bytes:
+    """تصدير عدة DataFrames في ملف Excel متعدد الأوراق"""
+    output = io.BytesIO()
+
+    with pd.ExcelWriter(output, engine='openpyxl') as writer:
+        for sheet_name, df in sheets.items():
+            export_df = df.copy()
+            for col in ["جميع المنافسين", "جميع_المنافسين"]:
+                if col in export_df.columns:
+                    export_df = export_df.drop(columns=[col])
+
+            safe_name = str(sheet_name)[:31]
+            export_df.to_excel(writer, sheet_name=safe_name, index=False)
+
+            # تنسيق تلقائي
+            ws = writer.sheets[safe_name]
+            for col in ws.columns:
+                max_len = max(len(str(cell.value or "")) for cell in col)
+                ws.column_dimensions[col[0].column_letter].width = min(max_len + 4, 50)
+
+    return output.getvalue()
+
+
+# ===== parse_pasted_text =====
+def parse_pasted_text(text: str):
     """
-    تصدير DataFrame إلى ملف Excel في الذاكرة
-    
-    Args:
-        df: البيانات المراد تصديرها
-        prefix: بادئة اسم الملف (اختياري)
-    
-    Returns:
-        بيانات الملف بصيغة bytes
+    تحليل نص ملصوق وتحويله إلى DataFrame
+    يدعم: CSV، TSV، جداول مفصولة بـ |
     """
-    try:
-        if df is None or df.empty:
-            return b""
-        
-        output = io.BytesIO()
-        
-        # إنشاء نسخة من DataFrame لتجنب التعديل على الأصلي
-        export_df = df.copy()
-        
-        # تنظيف الأعمدة غير المرغوبة
-        cols_to_drop = [col for col in export_df.columns if 'جميع المنافسين' in col or 'جميع_المنافسين' in col]
-        if cols_to_drop:
-            export_df = export_df.drop(columns=cols_to_drop)
-        
-        # كتابة إلى Excel
-        with pd.ExcelWriter(output, engine='openpyxl') as writer:
-            export_df.to_excel(writer, index=False, sheet_name=prefix[:31])  # حد أقصى 31 حرف
-        
-        output.seek(0)
-        return output.getvalue()
-    
-    except Exception as e:
-        return b""
+    if not text or not text.strip():
+        return None, "النص فارغ"
 
+    lines = [l.strip() for l in text.strip().split('\n') if l.strip()]
 
-def export_multiple_sheets(sheets_dict: Dict[str, pd.DataFrame]) -> bytes:
-    """
-    تصدير عدة جداول إلى ملف Excel واحد بصفحات متعددة
-    
-    Args:
-        sheets_dict: قاموس يحتوي على {اسم_الورقة: DataFrame}
-    
-    Returns:
-        بيانات الملف بصيغة bytes
-    """
-    try:
-        if not sheets_dict:
-            return b""
-        
-        output = io.BytesIO()
-        
-        with pd.ExcelWriter(output, engine='openpyxl') as writer:
-            for sheet_name, df in sheets_dict.items():
-                if df is not None and not df.empty:
-                    # تحديد طول اسم الورقة (Excel حد أقصى 31 حرف)
-                    safe_name = str(sheet_name)[:31]
-                    df.to_excel(writer, index=False, sheet_name=safe_name)
-        
-        output.seek(0)
-        return output.getvalue()
-    
-    except Exception as e:
-        return b""
+    if not lines:
+        return None, "لا توجد بيانات"
 
-
-# ════════════════════════════════════════════════════════════════════════════
-# دوال معالجة النصوص (Text Processing)
-# ════════════════════════════════════════════════════════════════════════════
-
-def parse_pasted_text(text: str) -> List[Dict[str, Any]]:
-    """
-    تحليل النص الملصق لاستخراج المنتجات والأسعار
-    
-    Args:
-        text: النص المراد تحليله
-    
-    Returns:
-        قائمة من قواميس تحتوي على {name, price}
-    """
-    products = []
-    
-    if not text:
-        return products
-    
-    try:
-        lines = text.strip().split('\n')
+    # محاولة 1: مفصول بـ |
+    if '|' in lines[0]:
+        rows = []
         for line in lines:
-            line = line.strip()
-            if not line:
-                continue
-            
-            # محاولة استخراج اسم وسعر
-            match = re.search(r'(\d+(?:\.\d+)?)', line)
-            if match:
-                try:
-                    price = float(match.group(1))
-                    name = line.replace(match.group(0), '').strip()
-                    if name:
-                        products.append({'name': name, 'price': price})
-                except:
-                    continue
-    except Exception as e:
+            if set(line.replace(' ', '').replace('-', '')) == {'|'}:
+                continue  # تخطي خطوط الفاصل
+            cells = [c.strip() for c in line.split('|') if c.strip()]
+            if cells:
+                rows.append(cells)
+
+        if len(rows) >= 2:
+            try:
+                df = pd.DataFrame(rows[1:], columns=rows[0])
+                return df, f"✅ تم تحليل {len(df)} صف"
+            except:
+                pass
+
+    # محاولة 2: TSV (tabs)
+    if '\t' in lines[0]:
+        try:
+            df = pd.read_csv(io.StringIO(text), sep='\t')
+            return df, f"✅ تم تحليل {len(df)} صف (TSV)"
+        except:
+            pass
+
+    # محاولة 3: CSV
+    try:
+        df = pd.read_csv(io.StringIO(text))
+        return df, f"✅ تم تحليل {len(df)} صف (CSV)"
+    except:
         pass
-    
-    return products
+
+    # محاولة 4: كل سطر منتج
+    if len(lines) >= 2:
+        df = pd.DataFrame({"البيانات": lines})
+        return df, f"✅ تم تحليل {len(df)} سطر"
+
+    return None, "❌ لا يمكن تحليل الصيغة. جرب CSV أو جدول مفصول بـ |"
 
 
-# ════════════════════════════════════════════════════════════════════════════
-# دوال معالجة البيانات (Data Processing)
-# ════════════════════════════════════════════════════════════════════════════
-
-def clean_dataframe(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    تنظيف DataFrame من الأخطاء والقيم الفارغة
-    
-    Args:
-        df: البيانات المراد تنظيفها
-    
-    Returns:
-        DataFrame منظف
-    """
-    if df is None or df.empty:
-        return df
-    
+# ===== صورة من صفحة المنتج (عند غياب عمود صورة في ملف المنافس) =====
+def fetch_og_image_url(url: str, timeout: float = 6.0) -> str:
+    """يجلب og:image (أو twitter:image) من HTML صفحة المنتج."""
+    u = (url or "").strip()
+    if not u.startswith("http"):
+        return ""
     try:
-        df = df.copy()
-        
-        # ملء القيم الفارغة بـ 0 للأعمدة الرقمية
-        numeric_cols = df.select_dtypes(include=['number']).columns
-        for col in numeric_cols:
-            df[col] = df[col].fillna(0)
-        
-        # ملء القيم الفارغة بـ "غير محدد" للأعمدة النصية
-        string_cols = df.select_dtypes(include=['object']).columns
-        for col in string_cols:
-            df[col] = df[col].fillna("غير محدد")
-        
-        return df
-    except:
-        return df
-
-
-def get_column_by_name_variant(df: pd.DataFrame, variants: List[str]) -> Optional[str]:
-    """
-    البحث عن عمود في DataFrame بناءً على قائمة من الأسماء المحتملة
-    
-    Args:
-        df: DataFrame للبحث فيه
-        variants: قائمة الأسماء المحتملة
-    
-    Returns:
-        اسم العمود إن وجد، وإلا None
-    """
-    if df is None:
-        return None
-    
-    for variant in variants:
-        if variant in df.columns:
-            return variant
-    
-    return None
-
-
-def safe_get_column(df: pd.DataFrame, col_name: str, default=None):
-    """
-    الحصول على عمود من DataFrame بأمان
-    
-    Args:
-        df: DataFrame
-        col_name: اسم العمود
-        default: القيمة الافتراضية إذا لم يكن العمود موجوداً
-    
-    Returns:
-        العمود أو القيمة الافتراضية
-    """
-    if df is None or col_name not in df.columns:
-        return default
-    return df[col_name]
-
-
-def rename_columns_safe(df: pd.DataFrame, mapping: Dict[str, str]) -> pd.DataFrame:
-    """
-    إعادة تسمية أعمدة DataFrame بأمان
-    
-    Args:
-        df: البيانات
-        mapping: قاموس يحتوي على {الاسم_القديم: الاسم_الجديد}
-    
-    Returns:
-        DataFrame مع الأعمدة المعاد تسميتها
-    """
-    if df is None:
-        return df
-    
-    try:
-        # تصفية المفاتيح التي توجد فعلاً في الأعمدة
-        valid_mapping = {k: v for k, v in mapping.items() if k in df.columns}
-        return df.rename(columns=valid_mapping)
-    except:
-        return df
-
-
-# ════════════════════════════════════════════════════════════════════════════
-# دوال مساعدة إضافية (Utility Functions)
-# ════════════════════════════════════════════════════════════════════════════
-
-def get_dataframe_info(df: pd.DataFrame) -> Dict[str, Any]:
-    """
-    الحصول على معلومات عن DataFrame
-    
-    Args:
-        df: البيانات
-    
-    Returns:
-        قاموس يحتوي على معلومات عن البيانات
-    """
-    if df is None or df.empty:
-        return {
-            "rows": 0,
-            "columns": 0,
-            "column_names": [],
-            "dtypes": {}
+        headers = {
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+            ),
+            "Accept": "text/html,application/xhtml+xml;q=0.9,*/*;q=0.8",
         }
-    
-    return {
-        "rows": len(df),
-        "columns": len(df.columns),
-        "column_names": df.columns.tolist(),
-        "dtypes": df.dtypes.to_dict(),
-        "memory_usage": df.memory_usage(deep=True).sum()
-    }
+        r = requests.get(u, timeout=timeout, headers=headers, allow_redirects=True)
+        if r.status_code != 200:
+            return ""
+        text = r.text[:900_000]
+        patterns = (
+            re.compile(
+                r'<meta[^>]+property=["\']og:image["\'][^>]+content=["\']([^"\']+)["\']',
+                re.I,
+            ),
+            re.compile(
+                r'<meta[^>]+content=["\']([^"\']+)["\'][^>]+property=["\']og:image["\']',
+                re.I,
+            ),
+            re.compile(
+                r'<meta[^>]+name=["\']twitter:image["\'][^>]+content=["\']([^"\']+)["\']',
+                re.I,
+            ),
+        )
+        for pat in patterns:
+            m = pat.search(text)
+            if m:
+                img = (m.group(1) or "").strip()
+                if img.startswith("https://") or img.startswith("http://"):
+                    return img
+                if img.startswith("//"):
+                    return "https:" + img
+    except Exception:
+        pass
+    return ""
 
 
-def filter_by_column_value(df: pd.DataFrame, column: str, value: Any) -> pd.DataFrame:
+def fetch_page_title_from_url(url: str, timeout: float = 8.0) -> str:
     """
-    فلترة DataFrame بناءً على قيمة عمود معين
-    
-    Args:
-        df: البيانات
-        column: اسم العمود
-        value: القيمة المراد البحث عنها
-    
-    Returns:
-        DataFrame مع الصفوف المطابقة
+    يجلب عنواناً مقروءاً من صفحة المنتج: og:title ثم twitter:title ثم <title>.
+    يُنظّف لاحقة المتجر الشائعة ( | Site — متجر).
     """
-    if df is None or column not in df.columns:
-        return df
-    
+    u = (url or "").strip()
+    if not u.startswith("http"):
+        return ""
     try:
-        return df[df[column].astype(str) == str(value)]
-    except:
-        return df
+        headers = {
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+            ),
+            "Accept": "text/html,application/xhtml+xml;q=0.9,*/*;q=0.8",
+            "Accept-Language": "ar,en-US;q=0.9,en;q=0.8",
+        }
+        r = requests.get(u, timeout=timeout, headers=headers, allow_redirects=True)
+        if r.status_code != 200:
+            return ""
+        text = r.text[:900_000]
+        raw = ""
+        for pat in (
+            re.compile(
+                r'<meta[^>]+property=["\']og:title["\'][^>]+content=["\']([^"\']+)["\']',
+                re.I,
+            ),
+            re.compile(
+                r'<meta[^>]+content=["\']([^"\']+)["\'][^>]+property=["\']og:title["\']',
+                re.I,
+            ),
+            re.compile(
+                r'<meta[^>]+name=["\']twitter:title["\'][^>]+content=["\']([^"\']+)["\']',
+                re.I,
+            ),
+            re.compile(r"<title[^>]*>([^<]{4,500})</title>", re.I | re.DOTALL),
+        ):
+            m = pat.search(text)
+            if m:
+                raw = (m.group(1) or "").strip()
+                if raw:
+                    break
+        if not raw:
+            return ""
+        title = html_std.unescape(raw).strip()
+        # أسطر متعددة (og:title أحياناً يكرر السطر مع/بدون حجم): نظّف كل سطر ثم خذ الأوضح
+        _lines = []
+        for ln in re.split(r"[\r\n]+", title):
+            ln = ln.strip()
+            if not ln:
+                continue
+            # بادئة «محلي» الشائعة في متاجر سعودية
+            ln = re.sub(r"^محلي\s*[-–—:،]\s*", "", ln)
+            ln = re.sub(r"^محلي\s+", "", ln).strip()
+            ln = re.sub(r"\s+", " ", ln)
+            if ln:
+                _lines.append(ln)
+        if _lines:
+            title = max(_lines, key=len)
+        else:
+            title = re.sub(r"\s+", " ", title).strip()
+        # إزالة لاحقة اسم المتجر الشائعة
+        for sep in (" | ", " – ", " — ", " - ", " :: "):
+            if sep in title:
+                left = title.split(sep)[0].strip()
+                if len(left) >= 6:
+                    title = left
+                    break
+        # إزالة بادئات عامة
+        title = re.sub(r"^(buy|shop|تسوق|اشتري)\s+", "", title, flags=re.I).strip()
+        title = re.sub(r"^محلي\s*[-–—:،]\s*", "", title).strip()
+        title = re.sub(r"^محلي\s+", "", title).strip()
+        return title[:220] if title else ""
+    except Exception:
+        return ""
 
-def make_columns_unique(df: pd.DataFrame) -> pd.DataFrame:
+
+def favicon_url_for_site(page_url: str) -> str:
+    """أيقونة موجّهة من خدمة عامة — احتياط عند فشل og:image."""
+    u = (page_url or "").strip()
+    if not u.startswith("http"):
+        return ""
+    try:
+        netloc = urlparse(u).netloc
+        if not netloc:
+            return ""
+        return f"https://www.google.com/s2/favicons?domain={netloc}&sz=128"
+    except Exception:
+        return ""
+
+
+# ===== BackgroundTask (stub) =====
+class BackgroundTask:
     """
-    Renames duplicate columns in a DataFrame to make them unique.
-    Appends a suffix like '_1', '_2' to duplicate column names.
+    محاكاة معالجة في الخلفية
+    ملاحظة: Streamlit لا يدعم true background threads بشكل كامل
+    هذا placeholder وظيفي
     """
-    cols = pd.Series(df.columns)
-    for dup in cols[cols.duplicated()].unique():
-        # Get all indices of the duplicate column
-        indices = cols[cols == dup].index.tolist()
-        for i, idx in enumerate(indices):
-            if i > 0: # Only rename subsequent duplicates
-                cols[idx] = f"{dup}_{i}"
-    df.columns = cols
-    return df
+    def __init__(self, func, *args, **kwargs):
+        self.func = func
+        self.args = args
+        self.kwargs = kwargs
+        self.result = None
+        self.done = False
+        self.error = None
+
+    def run(self):
+        """تشغيل المهمة مباشرة (synchronous)"""
+        try:
+            self.result = self.func(*self.args, **self.kwargs)
+            self.done = True
+        except Exception as e:
+            self.error = str(e)
+            self.done = True
+        return self.result
+
+    def is_done(self):
+        return self.done

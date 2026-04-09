@@ -5,40 +5,42 @@ utils/db_manager.py - v18.0
 - قرارات لكل منتج (موافق/تأجيل/إزالة)
 - سجل كامل بالتاريخ والوقت
 """
-import sqlite3, json, os, tempfile, logging
+import hashlib
+import logging
+import sqlite3, json, os
 from datetime import datetime
 
+from utils.data_paths import get_data_db_path
+
+_logger = logging.getLogger(__name__)
+
+# ── حد أقصى لحجم JSON المُخزَّن في DB (4 ميغابايت) ──────────────────────
+_MAX_JSON_BYTES = 4 * 1024 * 1024
+
+
+def _safe_json_dump(data, max_bytes: int = _MAX_JSON_BYTES) -> str:
+    """
+    تسلسل JSON مع حد أقصى للحجم.
+    إذا تجاوز الحد: يُزيل أولاً الحقول الثقيلة ("جميع_المنافسين")،
+    ثم يقتطع عند آخر 1000 صف.
+    """
+    full = json.dumps(data, ensure_ascii=False, default=str)
+    if len(full.encode('utf-8')) <= max_bytes:
+        return full
+    if isinstance(data, list):
+        light = [{k: v for k, v in r.items() if k != 'جميع_المنافسين'} for r in data]
+        s = json.dumps(light, ensure_ascii=False, default=str)
+        if len(s.encode('utf-8')) <= max_bytes:
+            _logger.warning("save_job_progress: results_json مقطوع الحقل الثقيل (%d صف)", len(data))
+            return s
+        trimmed = json.dumps(light[-1000:], ensure_ascii=False, default=str)
+        _logger.warning("save_job_progress: results_json مقتطع إلى آخر 1000 صف من %d", len(data))
+        return trimmed
+    return full
+
+# قاعدة SQLite الرئيسية — مسار الملف عبر get_data_db_path() (DATA_DIR على Railway)
 _DB_NAME = "pricing_v18.db"
-
-
-def _resolve_db_path() -> str:
-    """
-    مسار ملف SQLite قابل للكتابة على كل المنصات.
-    - MAHWOUS_DB_DIR: فرض مجلد (الأولوية القصوى)
-    - مجلد المشروع `data/pricing_v18.db` إن وُجد الملف أو المجلد — يوحّد القراءة/الكتابة مع الملفات على القرص
-    - وإلا tempfile.gettempdir() (Streamlit Cloud / إلخ)
-    """
-    override = os.environ.get("MAHWOUS_DB_DIR", "").strip()
-    if override:
-        parent = os.path.abspath(override)
-        os.makedirs(parent, exist_ok=True)
-        return os.path.join(parent, _DB_NAME)
-    project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    local_data = os.path.join(project_root, "data")
-    local_db = os.path.join(local_data, _DB_NAME)
-    if os.path.isfile(local_db):
-        return local_db
-    try:
-        os.makedirs(local_data, exist_ok=True)
-    except Exception:
-        pass
-    if os.path.isdir(local_data):
-        return local_db
-    return os.path.join(tempfile.gettempdir(), _DB_NAME)
-
-
-DB_PATH = _resolve_db_path()
-logger = logging.getLogger(__name__)
+DB_PATH = get_data_db_path(_DB_NAME)
 
 
 def _ts():
@@ -101,13 +103,18 @@ def init_db():
         processed INTEGER DEFAULT 0,
         results_json TEXT DEFAULT '[]',
         missing_json TEXT DEFAULT '[]',
+        audit_json TEXT DEFAULT '{}',
         our_file TEXT, comp_files TEXT
     )""")
-    # إضافة عمود missing_json إذا لم يكن موجوداً (للتوافق مع قواعد البيانات القديمة)
+    # إضافة أعمدة غائبة — يُتجاهل الخطأ فقط عند وجود العمود مسبقاً
     try:
         c.execute("ALTER TABLE job_progress ADD COLUMN missing_json TEXT DEFAULT '[]'")
-    except:
-        pass  # العمود موجود بالفعل
+    except sqlite3.OperationalError:
+        pass
+    try:
+        c.execute("ALTER TABLE job_progress ADD COLUMN audit_json TEXT DEFAULT '{}'")
+    except sqlite3.OperationalError:
+        pass
 
     # تاريخ التحليلات
     c.execute("""CREATE TABLE IF NOT EXISTS analysis_history (
@@ -131,6 +138,107 @@ def init_db():
         action TEXT DEFAULT 'hidden'
     )""")
 
+    # ══════════════════════════════════════════════════════════════════════
+    #  جداول نظام المطابقة الذكي متعدد المراحل (v19.0)
+    # ══════════════════════════════════════════════════════════════════════
+
+    # حالة المنتج — State Machine (pending/matched/review/missing/migrated/price_alert/archived)
+    c.execute("""CREATE TABLE IF NOT EXISTS product_states (
+        id             INTEGER PRIMARY KEY AUTOINCREMENT,
+        product_key    TEXT UNIQUE NOT NULL,
+        product_name   TEXT NOT NULL,
+        state          TEXT NOT NULL DEFAULT 'pending',
+        prev_state     TEXT DEFAULT '',
+        competitor     TEXT DEFAULT '',
+        match_score    REAL DEFAULT 0,
+        match_pass     INTEGER DEFAULT 0,
+        salla_id       TEXT DEFAULT '',
+        salla_sku      TEXT DEFAULT '',
+        migrated_at    TEXT DEFAULT '',
+        created_at     TEXT NOT NULL,
+        updated_at     TEXT NOT NULL,
+        meta_json      TEXT DEFAULT '{}'
+    )""")
+
+    # سجل محاولات المطابقة — لكل منتج، لكل مرور
+    c.execute("""CREATE TABLE IF NOT EXISTS match_attempts (
+        id             INTEGER PRIMARY KEY AUTOINCREMENT,
+        product_key    TEXT NOT NULL,
+        product_name   TEXT NOT NULL,
+        pass_number    INTEGER NOT NULL,
+        method         TEXT NOT NULL,
+        best_candidate TEXT DEFAULT '',
+        score          REAL DEFAULT 0,
+        result         TEXT DEFAULT 'no_match',
+        duration_ms    INTEGER DEFAULT 0,
+        attempted_at   TEXT NOT NULL
+    )""")
+    c.execute("CREATE INDEX IF NOT EXISTS idx_match_product ON match_attempts(product_key)")
+
+    # قائمة المراجعة — Event-Driven Review Queue
+    c.execute("""CREATE TABLE IF NOT EXISTS review_queue (
+        id             INTEGER PRIMARY KEY AUTOINCREMENT,
+        product_key    TEXT NOT NULL,
+        product_name   TEXT NOT NULL,
+        trigger_type   TEXT NOT NULL,
+        trigger_detail TEXT DEFAULT '',
+        old_value      TEXT DEFAULT '',
+        new_value      TEXT DEFAULT '',
+        priority       INTEGER DEFAULT 5,
+        status         TEXT DEFAULT 'pending',
+        created_at     TEXT NOT NULL,
+        resolved_at    TEXT DEFAULT ''
+    )""")
+    c.execute("CREATE INDEX IF NOT EXISTS idx_rq_status ON review_queue(status, priority)")
+
+    # كتالوج المنافسين — بطاقة مرنة لكل منافس لكل منتج
+    c.execute("""CREATE TABLE IF NOT EXISTS competitor_intel (
+        id             INTEGER PRIMARY KEY AUTOINCREMENT,
+        product_key    TEXT NOT NULL,
+        product_name   TEXT NOT NULL,
+        competitor     TEXT NOT NULL,
+        comp_price     REAL DEFAULT 0,
+        comp_url       TEXT DEFAULT '',
+        comp_sku       TEXT DEFAULT '',
+        availability   TEXT DEFAULT 'unknown',
+        last_seen      TEXT NOT NULL,
+        price_history  TEXT DEFAULT '[]',
+        UNIQUE(product_key, competitor)
+    )""")
+    c.execute("CREATE INDEX IF NOT EXISTS idx_ci_product ON competitor_intel(product_key)")
+
+    # سجل تنبيهات الأسعار (Delta Events)
+    c.execute("""CREATE TABLE IF NOT EXISTS price_alerts (
+        id             INTEGER PRIMARY KEY AUTOINCREMENT,
+        product_key    TEXT NOT NULL,
+        product_name   TEXT NOT NULL,
+        competitor     TEXT NOT NULL,
+        old_price      REAL NOT NULL,
+        new_price      REAL NOT NULL,
+        change_pct     REAL NOT NULL,
+        direction      TEXT NOT NULL,
+        alert_type     TEXT DEFAULT 'price_change',
+        status         TEXT DEFAULT 'open',
+        created_at     TEXT NOT NULL,
+        acknowledged_at TEXT DEFAULT ''
+    )""")
+    c.execute("CREATE INDEX IF NOT EXISTS idx_pa_status ON price_alerts(status, created_at)")
+
+    # إضافة أعمدة للجداول القديمة عند الترقية
+    _safe_alter = [
+        ("product_states",    "match_pass   INTEGER DEFAULT 0"),
+        ("product_states",    "salla_id     TEXT DEFAULT ''"),
+        ("product_states",    "salla_sku    TEXT DEFAULT ''"),
+        ("product_states",    "migrated_at  TEXT DEFAULT ''"),
+        ("competitor_intel",  "comp_sku     TEXT DEFAULT ''"),
+        ("competitor_intel",  "availability TEXT DEFAULT 'unknown'"),
+    ]
+    for tbl, col_def in _safe_alter:
+        try:
+            c.execute(f"ALTER TABLE {tbl} ADD COLUMN {col_def}")
+        except sqlite3.OperationalError:
+            pass
+
     conn.commit()
     conn.close()
 
@@ -144,7 +252,8 @@ def log_event(page, event_type, details="", product_name="", action=""):
             (_ts(), page, event_type, details, product_name, action)
         )
         conn.commit(); conn.close()
-    except: pass
+    except Exception as _e:
+        _logger.warning("log_event: فشل حفظ الحدث — %s", _e)
 
 
 # ─── قرارات ────────────────────────────────
@@ -161,7 +270,8 @@ def log_decision(product_name, old_status, new_status, reason="",
              competitor, old_status, new_status, reason)
         )
         conn.commit(); conn.close()
-    except: pass
+    except Exception as _e:
+        _logger.warning("log_decision: فشل حفظ القرار '%s' — %s", product_name, _e)
 
 
 def get_decisions(product_name=None, status=None, limit=100):
@@ -183,7 +293,9 @@ def get_decisions(product_name=None, status=None, limit=100):
             ).fetchall()
         conn.close()
         return [dict(r) for r in rows]
-    except: return []
+    except Exception as _e:
+        _logger.warning("get_decisions: فشل القراءة — %s", _e)
+        return []
 
 
 # ─── تاريخ الأسعار (الميزة الذكية) ──────────
@@ -197,32 +309,42 @@ def upsert_price_history(product_name, competitor, price,
     """
     conn = get_db()
     today = _date()
-
-    # آخر سعر مسجل لهذا المنتج/المنافس
-    last = conn.execute(
-        """SELECT price, date FROM price_history
-           WHERE product_name=? AND competitor=?
-           ORDER BY id DESC LIMIT 1""",
-        (product_name, competitor)
-    ).fetchone()
-
     price_changed = False
-    if last:
-        last_price = last["price"]
-        last_date  = last["date"]
-        price_changed = abs(float(price) - float(last_price)) > 0.01
+    try:
+        # BEGIN EXCLUSIVE يمنع race condition في Read-Modify-Write
+        # عند استدعاء متزامن من callbacks متعددة في Streamlit
+        conn.execute("BEGIN EXCLUSIVE")
 
-        if last_date == today:
-            # نفس اليوم → حدّث فقط
-            conn.execute(
-                """UPDATE price_history SET price=?,our_price=?,diff=?,
-                   match_score=?,decision=?,product_id=?
-                   WHERE product_name=? AND competitor=? AND date=?""",
-                (price, our_price, diff, match_score, decision,
-                 product_id, product_name, competitor, today)
-            )
+        last = conn.execute(
+            """SELECT price, date FROM price_history
+               WHERE product_name=? AND competitor=?
+               ORDER BY id DESC LIMIT 1""",
+            (product_name, competitor)
+        ).fetchone()
+
+        if last:
+            last_price = last["price"]
+            last_date  = last["date"]
+            price_changed = abs(float(price) - float(last_price)) > 0.01
+
+            if last_date == today:
+                conn.execute(
+                    """UPDATE price_history SET price=?,our_price=?,diff=?,
+                       match_score=?,decision=?,product_id=?
+                       WHERE product_name=? AND competitor=? AND date=?""",
+                    (price, our_price, diff, match_score, decision,
+                     product_id, product_name, competitor, today)
+                )
+            else:
+                conn.execute(
+                    """INSERT INTO price_history
+                       (date,product_name,competitor,price,our_price,diff,
+                        match_score,decision,product_id)
+                       VALUES (?,?,?,?,?,?,?,?,?)""",
+                    (today, product_name, competitor, price, our_price,
+                     diff, match_score, decision, product_id)
+                )
         else:
-            # يوم جديد → أضف سجل
             conn.execute(
                 """INSERT INTO price_history
                    (date,product_name,competitor,price,our_price,diff,
@@ -231,18 +353,13 @@ def upsert_price_history(product_name, competitor, price,
                 (today, product_name, competitor, price, our_price,
                  diff, match_score, decision, product_id)
             )
-    else:
-        # أول مرة
-        conn.execute(
-            """INSERT INTO price_history
-               (date,product_name,competitor,price,our_price,diff,
-                match_score,decision,product_id)
-               VALUES (?,?,?,?,?,?,?,?,?)""",
-            (today, product_name, competitor, price, our_price,
-             diff, match_score, decision, product_id)
-        )
-
-    conn.commit(); conn.close()
+        conn.commit()
+    except Exception as _e:
+        conn.rollback()
+        _logger.error("upsert_price_history: فشل — %s", _e)
+        raise
+    finally:
+        conn.close()
     return price_changed
 
 
@@ -264,7 +381,9 @@ def get_price_history(product_name, competitor="", limit=30):
             ).fetchall()
         conn.close()
         return [dict(r) for r in rows]
-    except: return []
+    except Exception as _e:
+        _logger.warning("get_price_history: فشل — %s", _e)
+        return []
 
 
 def get_price_changes(days=7):
@@ -289,26 +408,30 @@ def get_price_changes(days=7):
         ).fetchall()
         conn.close()
         return [dict(r) for r in rows]
-    except: return []
+    except Exception as _e:
+        _logger.warning("get_price_changes: فشل — %s", _e)
+        return []
 
 
 # ─── المعالجة الخلفية ──────────────────────
 def save_job_progress(job_id, total, processed, results, status="running",
-                      our_file="", comp_files="", missing=None):
+                      our_file="", comp_files="", missing=None, audit_stats=None):
     missing_data = json.dumps(missing if missing else [], ensure_ascii=False, default=str)
-    results_data = json.dumps(results, ensure_ascii=False, default=str)
+    results_data = _safe_json_dump(results)
+    audit_data   = json.dumps(audit_stats if audit_stats is not None else {},
+                              ensure_ascii=False, default=str)
     with sqlite3.connect(DB_PATH, check_same_thread=False, timeout=30) as conn:
         conn.execute("PRAGMA journal_mode=WAL;")
         conn.execute("PRAGMA busy_timeout=30000;")
         conn.execute(
             """INSERT OR REPLACE INTO job_progress
                (job_id,started_at,updated_at,status,total,processed,
-                results_json,missing_json,our_file,comp_files)
+                results_json,missing_json,our_file,comp_files,audit_json)
                VALUES (?,
                    COALESCE((SELECT started_at FROM job_progress WHERE job_id=?), ?),
-                   ?, ?, ?, ?, ?, ?, ?, ?)""",
+                   ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (job_id, job_id, _ts(), _ts(), status, total, processed,
-             results_data, missing_data, our_file, comp_files)
+             results_data, missing_data, our_file, comp_files, audit_data)
         )
         conn.commit()
 
@@ -322,18 +445,21 @@ def get_job_progress(job_id):
         conn.close()
         if row:
             d = dict(row)
-            _rj = d.get("results_json") or "[]"
-            _mj = d.get("missing_json") or "[]"
-            try:
-                d["results"] = json.loads(_rj)
-            except Exception:
+            try: d["results"] = json.loads(d.get("results_json", "[]"))
+            except Exception as _e:
+                _logger.warning("get_job_progress: فشل تحليل results_json — %s", _e)
                 d["results"] = []
-            try:
-                d["missing"] = json.loads(_mj)
-            except Exception:
+            try: d["missing"] = json.loads(d.get("missing_json", "[]"))
+            except Exception as _e:
+                _logger.warning("get_job_progress: فشل تحليل missing_json — %s", _e)
                 d["missing"] = []
+            try: d["audit"] = json.loads(d.get("audit_json") or "{}")
+            except Exception as _e:
+                _logger.warning("get_job_progress: فشل تحليل audit_json — %s", _e)
+                d["audit"] = {}
             return d
-    except: pass
+    except Exception as _e:
+        _logger.warning("get_job_progress: فشل قراءة DB — %s", _e)
     return None
 
 
@@ -346,40 +472,22 @@ def get_last_job():
         conn.close()
         if row:
             d = dict(row)
-            _rj = d.get("results_json") or "[]"
-            _mj = d.get("missing_json") or "[]"
-            try:
-                d["results"] = json.loads(_rj)
-            except Exception:
+            try: d["results"] = json.loads(d.get("results_json", "[]"))
+            except Exception as _e:
+                _logger.warning("get_last_job: فشل تحليل results_json — %s", _e)
                 d["results"] = []
-            try:
-                d["missing"] = json.loads(_mj)
-            except Exception:
+            try: d["missing"] = json.loads(d.get("missing_json", "[]"))
+            except Exception as _e:
+                _logger.warning("get_last_job: فشل تحليل missing_json — %s", _e)
                 d["missing"] = []
+            try: d["audit"] = json.loads(d.get("audit_json") or "{}")
+            except Exception as _e:
+                _logger.warning("get_last_job: فشل تحليل audit_json — %s", _e)
+                d["audit"] = {}
             return d
-    except: pass
+    except Exception as _e:
+        _logger.warning("get_last_job: فشل قراءة DB — %s", _e)
     return None
-
-
-def clear_missing_from_last_job():
-    """يمسح missing_json لآخر مهمة محفوظة حتى لا تُعاد المفقودات عند تحديث الصفحة."""
-    j = get_last_job()
-    if not j or not j.get("job_id"):
-        return False
-    try:
-        save_job_progress(
-            str(j["job_id"]),
-            int(j.get("total") or 0),
-            int(j.get("processed") or j.get("total") or 0),
-            j.get("results") or [],
-            status=str(j.get("status") or "done"),
-            our_file=j.get("our_file") or "",
-            comp_files=j.get("comp_files") or "",
-            missing=[],
-        )
-        return True
-    except Exception:
-        return False
 
 
 # ─── سجل التحليلات ─────────────────────────
@@ -393,7 +501,8 @@ def log_analysis(our_file, comp_file, total, matched, missing, summary=""):
             (_ts(), our_file, comp_file, total, matched, missing, summary)
         )
         conn.commit(); conn.close()
-    except: pass
+    except Exception as _e:
+        _logger.warning("log_analysis: فشل حفظ سجل التحليل — %s", _e)
 
 
 def get_analysis_history(limit=20):
@@ -404,7 +513,9 @@ def get_analysis_history(limit=20):
         ).fetchall()
         conn.close()
         return [dict(r) for r in rows]
-    except: return []
+    except Exception as _e:
+        _logger.warning("get_analysis_history: فشل — %s", _e)
+        return []
 
 
 def get_events(page=None, limit=50):
@@ -421,7 +532,9 @@ def get_events(page=None, limit=50):
             ).fetchall()
         conn.close()
         return [dict(r) for r in rows]
-    except: return []
+    except Exception as _e:
+        _logger.warning("get_events: فشل — %s", _e)
+        return []
 
 
 # ── دوال المنتجات المخفية الدائمة ──────────────────────
@@ -437,8 +550,9 @@ def save_hidden_product(product_key: str, product_name: str = "", action: str = 
         )
         conn.commit()
         conn.close()
-    except:
-        pass
+    except Exception as _e:
+        _logger.warning("save_hidden_product: فشل حفظ المنتج المخفي '%s' — %s", product_key, _e)
+
 
 def get_hidden_product_keys() -> set:
     """يُرجع مجموعة كل مفاتيح المنتجات المخفية من قاعدة البيانات"""
@@ -447,11 +561,114 @@ def get_hidden_product_keys() -> set:
         rows = conn.execute("SELECT product_key FROM hidden_products").fetchall()
         conn.close()
         return {r["product_key"] for r in rows}
-    except:
+    except Exception as _e:
+        _logger.warning("get_hidden_product_keys: فشل قراءة DB — %s", _e)
         return set()
 
 
-init_db()
+# ═══════════════════════════════════════════════════════════════
+#  الرادار التسعيري — Competitor Price History
+# ═══════════════════════════════════════════════════════════════
+
+def _init_competitor_price_history():
+    """يُنشئ جدول competitor_price_history إن لم يكن موجوداً."""
+    try:
+        conn = get_db()
+        conn.execute("""CREATE TABLE IF NOT EXISTS competitor_price_history (
+            id            INTEGER PRIMARY KEY AUTOINCREMENT,
+            comp_name     TEXT    NOT NULL,
+            product_id    TEXT    NOT NULL,
+            price         REAL    NOT NULL,
+            last_seen_date TEXT   NOT NULL,
+            UNIQUE(comp_name, product_id)
+        )""")
+        conn.commit()
+        conn.close()
+    except Exception as _e:
+        _logger.error("_init_competitor_price_history: فشل إنشاء الجدول — %s", _e)
+
+
+def _make_stable_product_id(raw_name: str) -> str:
+    """
+    [FIX CRITICAL-04] يُنتج معرّفاً مستقراً من اسم المنتج بعد التطبيع.
+
+    المشكلة الأصلية: product_id = اسم نصي خام.
+    إذا غيّر المنافس هجاء الاسم (مسافة زائدة، حرف مختلف) بين جلستين،
+    يُسجَّل المنتج كمنتج جديد وتضيع بيانات تاريخ السعر.
+
+    الحل: نُطبّع الاسم (lower + إزالة مسافات متعددة) ثم نأخذ أول 12 حرفاً
+    من SHA-256 كمعرّف ثابت. النص الأصلي يُحفظ في عمود product_name_raw.
+    """
+    import hashlib, re
+    norm = raw_name.strip().lower()
+    norm = re.sub(r"\s+", " ", norm)
+    return hashlib.sha256(norm.encode("utf-8")).hexdigest()[:16]
+
+
+def update_competitor_price(comp_name: str, product_id: str, current_price: float,
+                             product_name_raw: str = ""):
+    """
+    يحدّث سعر منتج المنافس ويُرجع:
+    - السعر القديم (float) إذا تغيّر السعر (لتتمكن الواجهة من عرض تنبيه)
+    - None إذا لم يتغير السعر أو إذا كان المنتج جديداً
+
+    [FIX CRITICAL-04] product_id الآن هو hash مستقر من الاسم المُطبَّع
+    بدلاً من النص الخام، ما يضمن استمرارية تاريخ السعر حتى عند تغيير الهجاء.
+    """
+    if not comp_name or not product_id or current_price is None:
+        return None
+
+    # [FIX CRITICAL-04] حوّل product_id إلى hash مستقر
+    # إذا مُرّر hash بالفعل (16 حرف hex) نُبقيه، وإلا نُعالجه
+    stable_id = (product_id if (len(product_id) == 16 and
+                                all(c in "0123456789abcdef" for c in product_id.lower()))
+                 else _make_stable_product_id(product_id))
+    raw_label  = product_name_raw or product_id   # للتسجيل والعرض
+
+    try:
+        today = _date()
+        conn  = get_db()
+
+        # تأكد من وجود عمود product_name_raw (migration آمن)
+        try:
+            conn.execute("ALTER TABLE competitor_price_history ADD COLUMN product_name_raw TEXT DEFAULT ''")
+            conn.commit()
+        except Exception:
+            pass   # العمود موجود بالفعل — لا بأس
+
+        row = conn.execute(
+            "SELECT price FROM competitor_price_history WHERE comp_name=? AND product_id=?",
+            (str(comp_name), stable_id)
+        ).fetchone()
+
+        if row is None:
+            conn.execute(
+                """INSERT INTO competitor_price_history
+                   (comp_name, product_id, product_name_raw, price, last_seen_date)
+                   VALUES (?,?,?,?,?)""",
+                (str(comp_name), stable_id, raw_label, float(current_price), today)
+            )
+            conn.commit()
+            conn.close()
+            return None
+
+        old_price     = float(row["price"])
+        price_changed = abs(float(current_price) - old_price) > 0.09
+
+        conn.execute(
+            """UPDATE competitor_price_history
+               SET price=?, last_seen_date=?, product_name_raw=?
+               WHERE comp_name=? AND product_id=?""",
+            (float(current_price), today, raw_label, str(comp_name), stable_id)
+        )
+        conn.commit()
+        conn.close()
+
+        return round(old_price, 2) if price_changed else None
+    except Exception as _e:
+        _logger.warning("update_competitor_price: فشل تحديث سعر '%s/%s' — %s",
+                        comp_name, product_id, _e)
+        return None
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -475,15 +692,13 @@ def init_db_v26(conn=None):
         UNIQUE(competitor, norm_name)
     )""")
 
-    # كتالوج متجرنا (يُحدَّث يومياً) — يشمل التكلفة ورابط صورة المنتج للمقارنة البصرية
+    # كتالوج متجرنا (يُحدَّث يومياً)
     cur.execute("""CREATE TABLE IF NOT EXISTS our_catalog (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         product_id TEXT UNIQUE,
         product_name TEXT NOT NULL,
         norm_name TEXT,
         price REAL,
-        cost_price REAL DEFAULT 0,
-        image_url TEXT DEFAULT '',
         first_seen TEXT,
         last_seen TEXT
     )""")
@@ -500,20 +715,6 @@ def init_db_v26(conn=None):
         new_price REAL,
         product_id TEXT,
         notes TEXT
-    )""")
-
-    # منتجات المنافس المكشوطة لحظياً (مرآة دائمة لـ product_state — مفتاح comp_url)
-    cur.execute("""CREATE TABLE IF NOT EXISTS scraped_competitor_products (
-        comp_url TEXT PRIMARY KEY,
-        name TEXT,
-        price REAL,
-        brand TEXT,
-        image_url TEXT,
-        sku TEXT,
-        competitor TEXT NOT NULL,
-        extraction_method TEXT,
-        first_seen TEXT,
-        last_seen TEXT NOT NULL
     )""")
 
     c_conn.commit()
@@ -564,107 +765,85 @@ def upsert_our_catalog(our_df, name_col="اسم المنتج", id_col="رقم ا
     return {"updated": rows_updated, "inserted": rows_inserted}
 
 
-def replace_our_catalog_from_dataframe(
-    our_df,
-    *,
-    name_col: str | None = None,
-    id_col: str | None = None,
-    price_col: str | None = None,
-    cost_col: str | None = None,
-    image_col: str | None = None,
-) -> dict:
-    """
-    يفرّغ جدول our_catalog ويعيد ملءه من DataFrame — للرفع الكامل أو استبدال بيانات الاختبار
-    بـ mahwous_catalog.csv الحقيقي.
-    """
-    import hashlib
-    import re
+def _comp_catalog_product_key(competitor: str, norm_name: str) -> str:
+    """مفتاح مستقر لصف المنافس (يتوافق مع عمود comp_product_key إن وُجد)."""
+    n = (norm_name or "").strip()
+    c = (competitor or "").strip() or "unknown"
+    if n:
+        return f"{c}::{n}"
+    h = hashlib.md5(f"{c}\0{n}".encode("utf-8")).hexdigest()[:16]
+    return f"{c}::__{h}"
 
-    import pandas as pd
 
-    if our_df is None or our_df.empty:
-        return {"inserted": 0, "cleared": False}
-
-    df = our_df.copy()
-
-    def _pick(candidates):
-        for c in candidates:
-            if c in df.columns:
-                return c
-        return None
-
-    nc = name_col or _pick(
-        ("اسم المنتج", "أسم المنتج", "name", "product_name", "المنتج", "Product Name")
-    )
-    ic = id_col or _pick(
-        ("رقم المنتج", "رمز المنتج sku", "sku", "SKU", "product_id", "Product ID")
-    )
-    pc = price_col or _pick(("السعر", "سعر المنتج", "price", "Price"))
-    cc = cost_col or _pick(
-        ("التكلفة", "سعر التكلفة", "cost", "cost_price", "تكلفة", "Cost")
-    )
-    img_c = image_col or _pick(
-        ("صورة المنتج", "image", "image_url", "الصورة", "img", "رابط الصورة")
-    )
-
-    if not nc or not pc:
-        logger.error("replace_our_catalog_from_dataframe: missing name or price column")
-        return {"inserted": 0, "cleared": False}
-
-    if ic and ic in df.columns:
-        df = df.drop_duplicates(subset=[ic], keep="last")
-
-    conn = get_db()
-    cur = conn.cursor()
+def _pragma_column_names(conn, table: str):
+    """أسماء أعمدة جدول — متوافق مع sqlite3.Row (لا تعتمد على row[1] فقط)."""
     try:
-        cur.execute("ALTER TABLE our_catalog ADD COLUMN cost_price REAL DEFAULT 0")
+        rows = conn.execute(f"PRAGMA table_info({table})").fetchall()
     except Exception:
-        pass
-    try:
-        cur.execute("ALTER TABLE our_catalog ADD COLUMN image_url TEXT DEFAULT ''")
-    except Exception:
-        pass
-    cur.execute("DELETE FROM our_catalog")
-    conn.commit()
-
-    today = datetime.now().strftime("%Y-%m-%d")
-    inserted = 0
-    for _, row in df.iterrows():
-        name = str(row.get(nc, "")).strip()
-        if not name or name.lower() in ("nan", "none", ""):
-            continue
-        norm = re.sub(r"\s+", " ", name.lower().strip())
-        pid = ""
-        if ic:
-            pid = str(row.get(ic, "")).strip().rstrip(".0")
-        if not pid:
-            pid = "auto-" + hashlib.sha256(norm.encode("utf-8")).hexdigest()[:16]
+        return []
+    out = []
+    for r in rows:
         try:
-            price = float(str(row.get(pc, 0)).replace(",", ""))
-        except Exception:
-            price = 0.0
-        cost = 0.0
-        if cc:
+            out.append(str(r["name"]))
+        except (KeyError, IndexError, TypeError):
             try:
-                cost = float(str(row.get(cc, 0)).replace(",", ""))
+                out.append(str(r[1]))
             except Exception:
-                cost = 0.0
-        img_val = ""
-        if img_c:
-            img_val = str(row.get(img_c, "") or "").strip()
-            if img_val.lower() in ("nan", "none", "null", ""):
-                img_val = ""
-        cur.execute(
-            """INSERT INTO our_catalog (product_id, product_name, norm_name, price, cost_price, image_url, first_seen, last_seen)
-               VALUES (?,?,?,?,?,?,?,?)""",
-            (pid, name, norm, price, cost, img_val, today, today),
-        )
-        inserted += 1
+                continue
+    return out
 
-    conn.commit()
-    conn.close()
-    logger.info("replace_our_catalog_from_dataframe: inserted %s rows", inserted)
-    return {"inserted": inserted, "cleared": True}
+
+def _resolve_comp_name_price_columns(cdf):
+    """
+    يفضّل أعمدة apply_user_column_map القياسية (المنتج، سعر المنتج) ثم يعود للتخمين.
+    """
+    cols = list(cdf.columns)
+    cs = set(cols)
+
+    if "المنتج" in cs:
+        name_col = "المنتج"
+    elif "اسم المنتج" in cs:
+        name_col = "اسم المنتج"
+    else:
+        name_col = None
+        price_col = None
+        for c in cols:
+            sample = str(cdf[c].dropna().iloc[0]) if not cdf[c].dropna().empty else ""
+            try:
+                float(sample.replace(",", ""))
+                if price_col is None:
+                    price_col = c
+            except Exception:
+                if name_col is None and len(sample) > 5:
+                    name_col = c
+        if name_col is None:
+            name_col = cols[0]
+        if price_col is None:
+            price_col = cols[1] if len(cols) > 1 else cols[0]
+        return name_col, price_col
+
+    if "سعر المنتج" in cs:
+        price_col = "سعر المنتج"
+    elif "السعر" in cs:
+        price_col = "السعر"
+    elif "سعر" in cs:
+        price_col = "سعر"
+    else:
+        price_col = None
+        for c in cols:
+            if c == name_col:
+                continue
+            sample = str(cdf[c].dropna().iloc[0]) if not cdf[c].dropna().empty else ""
+            try:
+                float(str(sample).replace(",", ""))
+                price_col = c
+                break
+            except Exception:
+                continue
+        if price_col is None:
+            price_col = cols[1] if len(cols) > 1 else cols[0]
+
+    return name_col, price_col
 
 
 def upsert_comp_catalog(comp_dfs: dict):
@@ -673,26 +852,12 @@ def upsert_comp_catalog(comp_dfs: dict):
     conn = get_db()
     today = datetime.now().strftime("%Y-%m-%d")
     total_new = 0
+    rows_updated = 0
+    _cc_cols = _pragma_column_names(conn, "comp_catalog")
+    _has_cpk = any(c.lower() == "comp_product_key" for c in _cc_cols)
 
     for cname, cdf in comp_dfs.items():
-        # استكشاف الأعمدة — يفضّل الأسماء المعيارية بعد التعيين اليدوي
-        cols = list(cdf.columns)
-        name_col  = "اسم المنتج" if "اسم المنتج" in cols else None
-        price_col = "السعر" if "السعر" in cols else None
-        for c in cols:
-            sample = str(cdf[c].dropna().iloc[0]) if not cdf[c].dropna().empty else ""
-            try:
-                float(sample.replace(",",""))
-                if price_col is None:
-                    price_col = c
-            except Exception:
-                if name_col is None and len(sample) > 5:
-                    name_col = c
-
-        if name_col is None:
-            name_col = cols[0]
-        if price_col is None:
-            price_col = cols[1] if len(cols) > 1 else cols[0]
+        name_col, price_col = _resolve_comp_name_price_columns(cdf)
 
         for _, row in cdf.iterrows():
             name = str(row.get(name_col, "")).strip()
@@ -708,80 +873,59 @@ def upsert_comp_catalog(comp_dfs: dict):
                 "SELECT id FROM comp_catalog WHERE competitor=? AND norm_name=?",
                 (cname, norm)
             ).fetchone()
+            _cpk = _comp_catalog_product_key(cname, norm)
 
             if existing:
-                conn.execute(
-                    "UPDATE comp_catalog SET price=?, last_seen=? WHERE id=?",
-                    (price, today, existing[0])
-                )
+                rows_updated += 1
+                if _has_cpk:
+                    conn.execute(
+                        "UPDATE comp_catalog SET price=?, last_seen=?, comp_product_key=? WHERE id=?",
+                        (price, today, _cpk, existing[0]),
+                    )
+                else:
+                    try:
+                        conn.execute(
+                            "UPDATE comp_catalog SET price=?, last_seen=? WHERE id=?",
+                            (price, today, existing[0]),
+                        )
+                    except sqlite3.IntegrityError:
+                        conn.execute(
+                            "UPDATE comp_catalog SET price=?, last_seen=?, comp_product_key=? WHERE id=?",
+                            (price, today, _cpk, existing[0]),
+                        )
+                        _has_cpk = True
             else:
-                conn.execute(
-                    """INSERT INTO comp_catalog (competitor, product_name, norm_name, price, first_seen, last_seen)
-                       VALUES (?,?,?,?,?,?)""",
-                    (cname, name, norm, price, today, today)
-                )
+                try:
+                    if _has_cpk:
+                        conn.execute(
+                            """INSERT INTO comp_catalog (competitor, product_name, norm_name, price,
+                                   first_seen, last_seen, comp_product_key)
+                               VALUES (?,?,?,?,?,?,?)""",
+                            (cname, name, norm, price, today, today, _cpk),
+                        )
+                    else:
+                        conn.execute(
+                            """INSERT INTO comp_catalog (competitor, product_name, norm_name, price, first_seen, last_seen)
+                               VALUES (?,?,?,?,?,?)""",
+                            (cname, name, norm, price, today, today),
+                        )
+                except sqlite3.IntegrityError as _ie:
+                    _em = str(_ie).lower()
+                    if "comp_product_key" in _em and not _has_cpk:
+                        conn.execute(
+                            """INSERT INTO comp_catalog (competitor, product_name, norm_name, price,
+                                   first_seen, last_seen, comp_product_key)
+                               VALUES (?,?,?,?,?,?,?)""",
+                            (cname, name, norm, price, today, today, _cpk),
+                        )
+                        _has_cpk = True
+                    else:
+                        raise
                 total_new += 1
 
     conn.commit()
     conn.close()
-    return {"new_products": total_new}
-
-
-def upsert_scraped_competitor_product(row: dict, extraction_method: str = "") -> None:
-    """
-    يحفظ كل صف منتج منافس ناجح من الكاشط في SQLite الدائمة (DB_PATH).
-    المفتاح: comp_url — يُحدَّث عند كل كشط ناجح.
-    """
-    from urllib.parse import urlparse
-
-    if not row:
-        return
-    comp_url = str(row.get("comp_url", "") or "").strip()
-    if not comp_url:
-        return
-    host = (urlparse(comp_url).netloc or "").lower() or "unknown"
-    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    name = str(row.get("name", "") or "")
-    try:
-        price = float(row.get("price", 0) or 0)
-    except (TypeError, ValueError):
-        price = 0.0
-    brand = str(row.get("brand", "") or "")
-    image_url = str(row.get("image_url", "") or row.get("comp_image_url", "") or "")
-    sku = str(row.get("sku", "") or "")
-    ext = (extraction_method or str(row.get("Extraction_Method", "") or "")).strip()[:120]
-
-    try:
-        conn = get_db()
-        prev = conn.execute(
-            "SELECT comp_url FROM scraped_competitor_products WHERE comp_url=?",
-            (comp_url,),
-        ).fetchone()
-        if prev is None:
-            conn.execute(
-                """INSERT INTO scraped_competitor_products
-                   (comp_url, name, price, brand, image_url, sku, competitor,
-                    extraction_method, first_seen, last_seen)
-                   VALUES (?,?,?,?,?,?,?,?,?,?)""",
-                (comp_url, name, price, brand, image_url, sku, host, ext, now, now),
-            )
-        else:
-            conn.execute(
-                """UPDATE scraped_competitor_products SET
-                   name=?, price=?, brand=?, image_url=?, sku=?, competitor=?,
-                   extraction_method=?, last_seen=?
-                   WHERE comp_url=?""",
-                (name, price, brand, image_url, sku, host, ext, now, comp_url),
-            )
-        conn.commit()
-        conn.close()
-    except Exception as e:
-        logger.debug("upsert_scraped_competitor_product skip: %s", e)
-
-
-def upsert_product(row: dict, extraction_method: str = "") -> None:
-    """واجهة موحّدة: حفظ منتج منافس مكشوط (JSON-LD / CSS / Regex) في القاعدة الدائمة."""
-    upsert_scraped_competitor_product(row, extraction_method=extraction_method)
+    return {"new_products": total_new, "updated": rows_updated}
 
 
 def save_processed(product_key: str, product_name: str, competitor: str,
@@ -801,8 +945,8 @@ def save_processed(product_key: str, product_name: str, competitor: str,
                  old_price, new_price, product_id, notes)
             )
             conn.commit()
-    except Exception:
-        pass  # لا يوقف الثريد الخلفي
+    except Exception as _e:
+        _logger.warning("save_processed: فشل حفظ المنتج المعالج '%s' — %s", product_key, _e)
 
 
 def get_processed(limit=200) -> list:
@@ -887,162 +1031,53 @@ def migrate_db_v26():
                        VALUES ('v26.0', 'إضافة جداول الأتمتة الذكية وسجل القرارات')""")
 
         # ── 5. إضافة أعمدة جديدة للجداول الموجودة (بأمان) ──
-        # إضافة عمود cost_price لجدول our_catalog إذا لم يكن موجوداً
-        try:
-            cur.execute("ALTER TABLE our_catalog ADD COLUMN cost_price REAL DEFAULT 0")
-        except Exception:
-            pass  # العمود موجود مسبقاً
-        try:
-            cur.execute("ALTER TABLE our_catalog ADD COLUMN image_url TEXT DEFAULT ''")
-        except Exception:
-            pass
+        # إضافة أعمدة جديدة — يُتجاهل الخطأ فقط عند وجود العمود مسبقاً
+        for _stmt in [
+            "ALTER TABLE our_catalog ADD COLUMN cost_price REAL DEFAULT 0",
+            "ALTER TABLE processed_products ADD COLUMN auto_processed INTEGER DEFAULT 0",
+            "ALTER TABLE comp_catalog ADD COLUMN comp_product_key TEXT",
+            "ALTER TABLE job_progress ADD COLUMN audit_json TEXT DEFAULT '{}'",
+        ]:
+            try:
+                cur.execute(_stmt)
+            except sqlite3.OperationalError:
+                pass
 
-        # إضافة عمود auto_processed لجدول processed_products
         try:
-            cur.execute("ALTER TABLE processed_products ADD COLUMN auto_processed INTEGER DEFAULT 0")
-        except Exception:
-            pass
-
-        cur.execute("""CREATE TABLE IF NOT EXISTS scraped_competitor_products (
-            comp_url TEXT PRIMARY KEY,
-            name TEXT,
-            price REAL,
-            brand TEXT,
-            image_url TEXT,
-            sku TEXT,
-            competitor TEXT NOT NULL,
-            extraction_method TEXT,
-            first_seen TEXT,
-            last_seen TEXT NOT NULL
-        )""")
+            cur.execute(
+                """UPDATE comp_catalog SET comp_product_key = competitor || '::' || IFNULL(norm_name, '')
+                   WHERE comp_product_key IS NULL OR TRIM(comp_product_key) = ''"""
+            )
+        except Exception as _e:
+            _logger.warning("migrate_db_v26: فشل تعبئة comp_product_key — %s", _e)
 
         conn.commit()
         conn.close()
     except Exception as e:
-        logger.exception("Migration v26 error: %s", e)
+        _logger.error("Migration v26 error: %s", e)
         try: conn.close()
-        except: pass
-
+        except Exception: pass
 
 
 # ═══════════════════════════════════════════════════════════════
-#  v26.1 — منع التكرار الصارم (Strict Duplicate Prevention)
+#  نقطة تهيئة واحدة — تُستدعى صراحةً من app.py عند الإقلاع
 # ═══════════════════════════════════════════════════════════════
+_DB_INITIALIZED = False
 
-import re as _re
 
-def _normalize_for_dedup(name: str) -> str:
+def initialize_database() -> None:
     """
-    تطبيع الاسم لفحص التكرار الصارم:
-    - تحويل لأحرف صغيرة
-    - إزالة المسافات الزائدة
-    - توحيد الأحجام: 100ML = 100ml
-    - إزالة علامات الترقيم
+    تهيّئ قاعدة البيانات كاملةً مرة واحدة فقط لكل عملية.
+    تشمل: init_db + _init_competitor_price_history + init_db_v26 + migrate_db_v26.
+    آمنة للاستدعاء المتعدد (idempotent بواسطة العلم _DB_INITIALIZED).
     """
-    if not name:
-        return ""
-    n = name.lower().strip()
-    n = _re.sub(r'\s+', ' ', n)
-    n = _re.sub(r'[^\w\s]', '', n)
-    # توحيد الأحجام: 100 ml = 100ml
-    n = _re.sub(r'(\d+)\s*ml', r'ml', n)
-    n = _re.sub(r'(\d+)\s*م\s*ل', r'ml', n)
-    return n.strip()
+    global _DB_INITIALIZED
+    if _DB_INITIALIZED:
+        return
+    init_db()
+    _init_competitor_price_history()
+    init_db_v26()
+    migrate_db_v26()
+    _DB_INITIALIZED = True
+    _logger.info("initialize_database: قاعدة البيانات جاهزة — %s", DB_PATH)
 
-
-def check_strict_duplicate(product_name: str,
-                             sku: str = "",
-                             brand: str = "",
-                             catalog: str = "our") -> dict:
-    """
-    فحص تكرار صارم قبل إضافة أي منتج.
-    يتحقق من 3 معايير:
-    1. الاسم المطبّع (Normalized Name)
-    2. الباركود / SKU (إذا متوفر)
-    3. العلامة التجارية + اسم مطبّع مختصر
-
-    المُعيد:
-    {
-        "is_duplicate": bool,
-        "method": "name" / "sku" / "brand+name" / None,
-        "existing_name": str,
-        "existing_id": str
-    }
-    """
-    table = "our_catalog" if catalog == "our" else "comp_catalog"
-    norm = _normalize_for_dedup(product_name)
-    result = {"is_duplicate": False, "method": None,
-              "existing_name": "", "existing_id": ""}
-
-    try:
-        conn = get_db()
-
-        # ── فحص 1: الاسم المطبّع ──
-        if norm:
-            row = conn.execute(
-                f"SELECT product_name, product_id FROM {table} WHERE norm_name=? LIMIT 1",
-                (norm,)
-            ).fetchone()
-            if row:
-                result.update({"is_duplicate": True, "method": "name",
-                                "existing_name": row[0], "existing_id": row[1] or ""})
-                conn.close()
-                return result
-
-        # ── فحص 2: SKU / Barcode ──
-        if sku and sku.strip() and catalog == "our":
-            row = conn.execute(
-                "SELECT product_name, product_id FROM our_catalog WHERE product_id=? LIMIT 1",
-                (sku.strip(),)
-            ).fetchone()
-            if row:
-                result.update({"is_duplicate": True, "method": "sku",
-                                "existing_name": row[0], "existing_id": row[1] or ""})
-                conn.close()
-                return result
-
-        # ── فحص 3: العلامة التجارية + الاسم المختصر ──
-        if brand and norm:
-            brand_norm = _normalize_for_dedup(brand)
-            # استخرج الكلمات الجوهرية (أول 4 كلمات بعد الماركة)
-            name_without_brand = norm.replace(brand_norm, "").strip()
-            key_words = " ".join(name_without_brand.split()[:4])
-            if len(key_words) > 5:
-                rows = conn.execute(
-                    f"SELECT product_name, product_id, norm_name FROM {table} "                    f"WHERE norm_name LIKE ? LIMIT 5",
-                    (f"%{brand_norm}%",)
-                ).fetchall()
-                for r in rows:
-                    existing_norm = r[2] or ""
-                    existing_key = " ".join(
-                        existing_norm.replace(brand_norm, "").strip().split()[:4]
-                    )
-                    if existing_key and existing_key == key_words:
-                        result.update({"is_duplicate": True, "method": "brand+name",
-                                        "existing_name": r[0], "existing_id": r[1] or ""})
-                        conn.close()
-                        return result
-
-        conn.close()
-    except Exception as e:
-        pass  # لا يوقف سير العمل
-
-    return result
-
-
-def bulk_check_duplicates(products: list, catalog: str = "our") -> list:
-    """
-    فحص تكرار مجمّع لقائمة منتجات.
-    كل عنصر في products: {"name": str, "sku": str, "brand": str}
-    يُعيد قائمة: [{...original..., "duplicate_check": {...}}, ...]
-    """
-    results = []
-    for p in products:
-        check = check_strict_duplicate(
-            product_name=p.get("name", ""),
-            sku=p.get("sku", ""),
-            brand=p.get("brand", ""),
-            catalog=catalog
-        )
-        results.append({**p, "duplicate_check": check})
-    return results

@@ -18,35 +18,14 @@ import requests
 import json
 import os
 import time
-import logging
 from typing import List, Dict, Any, Optional
-import pandas as pd
-
-logger = logging.getLogger(__name__)
 
 
-# ── Webhook URLs (Environment أو Streamlit Secrets فقط — لا تضع روابط إنتاج في الكود) ──
-def _webhook_from_env_or_secrets(key: str) -> str:
-    v = (os.environ.get(key) or "").strip()
-    if v:
-        return v
-    try:
-        import streamlit as st
-
-        if hasattr(st, "secrets") and key in st.secrets:
-            return str(st.secrets[key]).strip()
-    except Exception:
-        pass
-    return ""
-
-
-def get_webhook_update_prices() -> str:
-    """قراءة حيّة من البيئة أو secrets (لا تعتمد على وقت استيراد الوحدة)."""
-    return _webhook_from_env_or_secrets("WEBHOOK_UPDATE_PRICES") or _webhook_from_env_or_secrets("MAKE_WEBHOOK_URL")
-
-
-def get_webhook_new_products() -> str:
-    return _webhook_from_env_or_secrets("WEBHOOK_NEW_PRODUCTS")
+# ── Webhook URLs ───────────────────────────────────────────────────────────
+# يجب ضبط هذه المتغيرات في بيئة التشغيل (Railway / .env).
+# لا يوجد fallback إنتاجي هنا — أي إرسال بدون URL سيُعيد خطأ صريحاً.
+WEBHOOK_UPDATE_PRICES = os.environ.get("WEBHOOK_UPDATE_PRICES", "").strip()
+WEBHOOK_NEW_PRODUCTS  = os.environ.get("WEBHOOK_NEW_PRODUCTS",  "").strip()
 
 TIMEOUT = 15  # ثانية
 
@@ -61,104 +40,29 @@ def _post_to_webhook(url: str, payload: Any) -> Dict:
         return {"success": False, "message": "❌ Webhook URL غير محدد", "status_code": 0}
     try:
         headers = {"Content-Type": "application/json"}
-        logger.info("POST webhook payload keys=%s", list(payload.keys()) if isinstance(payload, dict) else type(payload))
         resp = requests.post(
             url,
             json=payload,
             headers=headers,
             timeout=TIMEOUT
         )
-        resp.raise_for_status()
+        if resp.status_code in (200, 201, 202, 204):
+            return {
+                "success": True,
+                "message": f"✅ تم الإرسال بنجاح ({resp.status_code})",
+                "status_code": resp.status_code,
+            }
         return {
-            "success": True,
-            "message": f"✅ تم الإرسال بنجاح ({resp.status_code})",
+            "success": False,
+            "message": f"❌ HTTP {resp.status_code}: {resp.text[:200]}",
             "status_code": resp.status_code,
         }
-    except requests.exceptions.HTTPError as e:
-        code = getattr(e.response, "status_code", 0)
-        body = getattr(e.response, "text", "")[:200] if getattr(e, "response", None) else ""
-        logger.exception("Make webhook HTTP error: status=%s body=%s", code, body)
-        return {"success": False, "message": f"❌ HTTP {code}: {body}", "status_code": code}
     except requests.exceptions.Timeout:
-        logger.exception("Make webhook timeout")
         return {"success": False, "message": "❌ انتهت مهلة الاتصال (Timeout)", "status_code": 0}
     except requests.exceptions.ConnectionError:
-        logger.exception("Make webhook connection error")
         return {"success": False, "message": "❌ فشل الاتصال بـ Make — تحقق من الإنترنت", "status_code": 0}
     except Exception as e:
-        logger.exception("Make webhook unexpected error")
         return {"success": False, "message": f"❌ خطأ غير متوقع: {str(e)}", "status_code": 0}
-
-
-def send_approved_prices_to_make(df: pd.DataFrame) -> bool:
-    """
-    إرسال أسعار المنتجات المعتمدة إلى Make.com بصيغة إنتاجية.
-    Payload:
-      {"products": [{"sku":"...", "new_price": 123.0, "action":"Increase Price 📈"}, ...]}
-    """
-    if df is None or df.empty:
-        logger.info("send_approved_prices_to_make: empty dataframe")
-        return False
-
-    webhook = get_webhook_update_prices()
-    if not webhook:
-        logger.error("send_approved_prices_to_make: webhook URL missing")
-        return False
-
-    payload_rows: List[Dict[str, Any]] = []
-    work = df.copy()
-    if "sku" not in work.columns:
-        logger.error("send_approved_prices_to_make: sku column missing")
-        return False
-
-    for _, row in work.iterrows():
-        sku = _clean_pid(row.get("sku", "")) or str(row.get("sku", "")).strip()
-        if not sku:
-            continue
-        new_price = _safe_float(
-            row.get("suggested_price", 0) or row.get("new_price", 0) or row.get("price", 0)
-        )
-        if new_price <= 0:
-            continue
-        action = str(row.get("action_required", "") or row.get("action", "approved")).strip() or "approved"
-        payload_rows.append(
-            {
-                "sku": sku,
-                "new_price": float(new_price),
-                "action": action,
-            }
-        )
-
-    if not payload_rows:
-        logger.warning("send_approved_prices_to_make: no valid rows to send")
-        return False
-
-    payload = {"products": payload_rows}
-    try:
-        logger.info("Sending approved prices to Make rows=%s", len(payload_rows))
-        resp = requests.post(
-            webhook,
-            json=payload,
-            headers={"Content-Type": "application/json"},
-            timeout=10,
-        )
-        resp.raise_for_status()
-        logger.info("Make approved prices success status=%s", resp.status_code)
-        return True
-    except requests.exceptions.Timeout:
-        logger.exception("send_approved_prices_to_make timeout")
-        return False
-    except requests.exceptions.HTTPError as e:
-        r = getattr(e, "response", None)
-        logger.exception(
-            "send_approved_prices_to_make http_error status=%s body=%s",
-            getattr(r, "status_code", 0) if r is not None else 0,
-            (getattr(r, "text", "") or "")[:300] if r is not None else "",
-        )
-        return False
-    except Exception:
-        logger.exception("send_approved_prices_to_make unexpected error")
-        return False
 
 
 # ── تحويل float آمن ───────────────────────────────────────────────────────
@@ -228,11 +132,15 @@ def export_to_make_format(df, section_type: str = "update") -> List[Dict]:
         )
 
         if section_type == "raise":
-            # سعرنا أعلى → نُخفّض لسعر المنافس مطروحاً ريال
-            price = round(comp_price - 1, 2) if comp_price > 0 else our_price
+            # قسم "سعر أعلى": سعرنا أعلى من المنافس → نُخفّض إلى comp_price - 1
+            # الشرط: يجب أن يكون لدينا سعر أصلي وأن الهدف فعلاً أقل منه
+            _target = round(comp_price - 1, 2) if comp_price > 0 else our_price
+            price = _target if (our_price > 0 and _target < our_price) else our_price
         elif section_type == "lower":
-            # سعرنا أقل → نرفع لسعر المنافس مطروحاً ريال (نبقى أقل بريال)
-            price = round(comp_price - 1, 2) if comp_price > 0 else our_price
+            # قسم "سعر أقل": سعرنا أقل من المنافس → نرفع إلى comp_price - 1 (نزيد الهامش)
+            # الشرط: يجب أن يكون الهدف فعلاً أعلى من سعرنا الحالي
+            _target = round(comp_price - 1, 2) if comp_price > 0 else our_price
+            price = _target if (our_price > 0 and _target > our_price) else our_price
         elif section_type in ("approved", "update"):
             price = our_price
         else:
@@ -245,7 +153,7 @@ def export_to_make_format(df, section_type: str = "update") -> List[Dict]:
         comp_name  = str(row.get("منتج_المنافس", ""))
         comp_src   = str(row.get("المنافس", ""))
         diff       = _safe_float(row.get("الفرق", 0))
-        match_pct  = _safe_float(row.get("match_score", 0))
+        match_pct  = _safe_float(row.get("نسبة_التطابق", 0))
         decision   = str(row.get("القرار", ""))
         brand      = str(row.get("الماركة", ""))
 
@@ -295,28 +203,67 @@ def send_single_product(product: Dict) -> Dict:
         return {"success": False, "message": "❌ اسم المنتج مطلوب"}
     if price <= 0:
         return {"success": False, "message": f"❌ السعر غير صحيح: {price}"}
+    if not product_id:
+        return {
+            "success": False,
+            "message": f"❌ رقم المنتج (ID) مطلوب لتحديث سلة — «{name}» لا يملك رقماً. أضف عمود رقم المنتج في ملف كتالوجك.",
+        }
 
     # ── Payload مطابق لما يقرأه Make: {{2.products}} ─────────────────────
-    payload = {
-        "products": [{
-            "product_id":  product_id,
-            "name":        name,
-            "price":       float(price),
-            "section":     product.get("section", "update"),
-            "comp_name":   product.get("comp_name", ""),
-            "competitor":  product.get("competitor", ""),
-            "price_diff":  product.get("price_diff", product.get("diff", 0)),
-            "match_score": product.get("match_score", 0),
-            "decision":    product.get("decision", ""),
-            "brand":       product.get("brand", ""),
-        }]
+    # Salla UpdateProduct يتوقع price كـ uinteger
+    _prod = {
+        "product_id":  product_id,
+        "name":        name,
+        "price":       int(round(price)),
+        "section":     product.get("section", "update"),
+        "comp_name":   product.get("comp_name", ""),
+        "competitor":  product.get("competitor", ""),
+        "price_diff":  product.get("price_diff", product.get("diff", 0)),
+        "match_score": product.get("match_score", 0),
+        "decision":    product.get("decision", ""),
+        "brand":       product.get("brand", ""),
     }
+    _cu = str(product.get("comp_url", product.get("رابط_المنافس", "")) or "").strip()
+    if _cu:
+        _prod["comp_url"] = _cu
 
-    result = _post_to_webhook(get_webhook_update_prices(), payload)
+    payload = {"products": [_prod]}
+
+    result = _post_to_webhook(WEBHOOK_UPDATE_PRICES, payload)
     if result["success"]:
         pid_info = f" [ID: {product_id}]" if product_id else ""
         result["message"] = f"✅ تم تحديث «{name}»{pid_info} ← {price:,.0f} ر.س"
     return result
+
+
+def trigger_price_update(
+    sku: str,
+    target_price: float,
+    comp_url: str = "",
+    *,
+    name: str = "",
+    comp_name: str = "",
+    comp_price: float = 0.0,
+    diff: float = 0.0,
+    decision: str = "",
+    competitor: str = "",
+) -> bool:
+    """
+    غلاف تفاعلي لإرسال تحديث سعر واحد إلى Make.com.
+    يعيد True عند نجاح HTTP — للاستخدام من أزرار الواجهة.
+    """
+    res = send_single_product({
+        "product_id": sku,
+        "name": name,
+        "price": float(target_price),
+        "comp_name": comp_name,
+        "comp_price": comp_price,
+        "diff": diff,
+        "decision": decision,
+        "competitor": competitor,
+        "comp_url": comp_url or "",
+    })
+    return bool(res.get("success"))
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -341,14 +288,14 @@ def send_price_updates(products: List[Dict]) -> Dict:
         price      = _safe_float(p.get("price", 0))
         product_id = _clean_pid(p.get("product_id", ""))
 
-        if not name or price <= 0:
+        if not name or price <= 0 or not product_id:
             skipped += 1
             continue
 
         valid_products.append({
             "product_id":  product_id,
             "name":        name,
-            "price":       float(price),
+            "price":       int(round(price)),
             "section":     p.get("section", "update"),
             "comp_name":   p.get("comp_name", ""),
             "competitor":  p.get("competitor", ""),
@@ -366,7 +313,7 @@ def send_price_updates(products: List[Dict]) -> Dict:
 
     # ── Payload مطابق لما يقرأه Make: {{2.products}} ─────────────────────
     payload = {"products": valid_products}
-    result = _post_to_webhook(get_webhook_update_prices(), payload)
+    result = _post_to_webhook(WEBHOOK_UPDATE_PRICES, payload)
 
     if result["success"]:
         skip_msg = f" (تم تخطي {skipped})" if skipped else ""
@@ -403,21 +350,22 @@ def send_new_products(products: List[Dict]) -> Dict:
             continue
 
         # ── بنية البيانات المطابقة لـ Interface سيناريو Make ─────────────
+        # Salla CreateProduct يتوقع uinteger للأسعار والوزن → int(round(...))
         item = {
             "product_id":      pid,
             "أسم المنتج":      name,
-            "سعر المنتج":      float(price),
+            "سعر المنتج":      int(round(float(price))) if price else 0,
             "رمز المنتج sku":  str(p.get("sku", p.get("رمز المنتج sku", ""))).strip(),
-            "الوزن":           int(_safe_float(p.get("weight", p.get("الوزن", 1))) or 1),
-            "سعر التكلفة":     float(_safe_float(p.get("cost_price", p.get("سعر التكلفة", 0)))),
-            "السعر المخفض":    float(_safe_float(p.get("sale_price",  p.get("السعر المخفض", 0)))),
+            "الوزن":           max(1, int(round(_safe_float(p.get("weight", p.get("الوزن", 1))) or 1))),
+            "سعر التكلفة":     int(round(_safe_float(p.get("cost_price", p.get("سعر التكلفة", 0))))),
+            "السعر المخفض":    int(round(_safe_float(p.get("sale_price",  p.get("السعر المخفض", 0))))),
             "الوصف":           str(p.get("الوصف", p.get("description", ""))).strip(),
         }
         # حقل صورة اختياري
         if p.get("image_url"):
             item["صورة المنتج"] = str(p["image_url"])
 
-        result = _post_to_webhook(get_webhook_new_products(), {"data": [item]})
+        result = _post_to_webhook(WEBHOOK_NEW_PRODUCTS, {"data": [item]})
         if result["success"]:
             sent += 1
         else:
@@ -461,20 +409,21 @@ def send_missing_products(products: List[Dict]) -> Dict:
             continue
 
         # ── بنية البيانات المطابقة لـ Interface سيناريو Make ─────────────
+        # Salla CreateProduct يتوقع uinteger للأسعار والوزن → int(round(...))
         item = {
             "product_id":      pid,
             "أسم المنتج":      name,
-            "سعر المنتج":      float(price),
+            "سعر المنتج":      int(round(float(price))) if price else 0,
             "رمز المنتج sku":  str(p.get("sku", p.get("رمز المنتج sku", ""))).strip(),
-            "الوزن":           int(_safe_float(p.get("weight", p.get("الوزن", 1))) or 1),
-            "سعر التكلفة":     float(_safe_float(p.get("cost_price", p.get("سعر التكلفة", 0)))),
-            "السعر المخفض":    float(_safe_float(p.get("sale_price",  p.get("السعر المخفض", 0)))),
+            "الوزن":           max(1, int(round(_safe_float(p.get("weight", p.get("الوزن", 1))) or 1))),
+            "سعر التكلفة":     int(round(_safe_float(p.get("cost_price", p.get("سعر التكلفة", 0))))),
+            "السعر المخفض":    int(round(_safe_float(p.get("sale_price",  p.get("السعر المخفض", 0))))),
             "الوصف":           str(p.get("الوصف", p.get("description", ""))).strip(),
         }
         if p.get("image_url"):
             item["صورة المنتج"] = str(p["image_url"])
 
-        result = _post_to_webhook(get_webhook_new_products(), {"data": [item]})
+        result = _post_to_webhook(WEBHOOK_NEW_PRODUCTS, {"data": [item]})
         if result["success"]:
             sent += 1
         else:
@@ -579,209 +528,6 @@ def send_batch_smart(products: list, batch_type: str = "update",
     }
 
 
-
-# ══════════════════════════════════════════════════════════════════════════
-#  فحص Safety Net قبل إرسال تحديثات الأسعار
-# ══════════════════════════════════════════════════════════════════════════
-
-def _safety_validate_price_update(product: dict,
-                                   max_drop_pct: float = 30.0,
-                                   max_raise_pct: float = 50.0,
-                                   abs_min_price: float = 10.0) -> tuple:
-    """
-    يتحقق من أن تحديث السعر منطقي قبل الإرسال.
-    يُعيد: (is_safe: bool, reason: str)
-    """
-    new_price  = _safe_float(product.get("price", 0))
-    old_price  = _safe_float(product.get("old_price", 0))
-
-    # حد أدنى مطلق
-    if new_price > 0 and new_price < abs_min_price:
-        return False, f"السعر {new_price:.0f} ر.س أقل من الحد الأدنى {abs_min_price:.0f} ر.س"
-
-    if old_price > 0 and new_price > 0:
-        change_pct = abs(new_price - old_price) / old_price * 100
-        if new_price < old_price and change_pct > max_drop_pct:
-            return False, f"انخفاض {change_pct:.1f}% > {max_drop_pct:.0f}% ({old_price:.0f} → {new_price:.0f})"
-        if new_price > old_price and change_pct > max_raise_pct:
-            return False, f"ارتفاع {change_pct:.1f}% > {max_raise_pct:.0f}% ({old_price:.0f} → {new_price:.0f})"
-
-    return True, ""
-
-
-def send_price_updates_safe(products: list,
-                             max_drop_pct: float = 30.0,
-                             max_raise_pct: float = 50.0,
-                             abs_min_price: float = 10.0) -> dict:
-    """
-    نسخة آمنة من send_price_updates — تفحص كل منتج بـ Safety Net أولاً.
-    المنتجات المحجوبة تُعاد في blocked_products للمراجعة اليدوية.
-    """
-    if not products:
-        return {"success": False, "message": "❌ لا توجد منتجات",
-                "sent": 0, "blocked": 0, "blocked_products": []}
-
-    safe_products    = []
-    blocked_products = []
-
-    for p in products:
-        is_safe, reason = _safety_validate_price_update(
-            p, max_drop_pct, max_raise_pct, abs_min_price
-        )
-        if is_safe:
-            safe_products.append(p)
-        else:
-            blocked_products.append({**p, "_block_reason": reason})
-
-    result = {
-        "sent": 0,
-        "blocked": len(blocked_products),
-        "blocked_products": blocked_products,
-    }
-
-    if safe_products:
-        send_result = send_price_updates(safe_products)
-        result["success"] = send_result.get("success", False)
-        result["sent"]    = len(safe_products) if send_result.get("success") else 0
-        result["message"] = send_result.get("message", "")
-    else:
-        result["success"] = False
-        result["message"] = "⛔ جميع المنتجات محجوبة بواسطة Safety Net"
-
-    if blocked_products:
-        result["message"] += f" | ⛔ {len(blocked_products)} محجوب للمراجعة"
-
-    return result
-
-
-def is_pricing_webhook_configured() -> bool:
-    """True إذا كان WEBHOOK_UPDATE_PRICES مُعرّفاً في البيئة أو secrets."""
-    u = get_webhook_update_prices()
-    return bool(u and u.strip())
-
-
-def build_pricing_sync_payload(
-    df,
-    *,
-    price_col: str = "suggested_price",
-    skip_unchanged: bool = True,
-    min_new_price: float = 1.0,
-) -> List[Dict]:
-    """
-    يحوّل مخرجات لوحة التسعير (final_priced_df) إلى قائمة جاهزة لـ Make:
-    السعر المرسل = السعر المقترح، مع old_price للسلامة (Safety Net).
-    """
-    if df is None or (hasattr(df, "empty") and df.empty):
-        return []
-
-    products: List[Dict] = []
-    for _, row in df.iterrows():
-        name = str(row.get("name", "") or "").strip()
-        if not name or name in ("nan", "None"):
-            continue
-        old_p = _safe_float(row.get("price", 0))
-        new_p = _safe_float(row.get(price_col, 0))
-        if new_p < min_new_price:
-            continue
-        if skip_unchanged and abs(new_p - old_p) < 0.01:
-            continue
-        pid = _clean_pid(
-            row.get("معرف_المنتج")
-            or row.get("product_id")
-            or row.get("sku")
-            or row.get("SKU")
-            or ""
-        )
-        comp_name = str(row.get("comp_name", "") or "")
-        mscore = _safe_float(row.get("match_score", 0))
-        products.append(
-            {
-                "product_id": pid,
-                "name": name,
-                "price": float(new_p),
-                "old_price": float(old_p),
-                "section": "vsp_dashboard",
-                "comp_name": comp_name if comp_name not in ("nan", "None", "") else "",
-                "match_score": mscore,
-            }
-        )
-    return products
-
-
-def bulk_sync_pricing_recommendations(
-    products: List[Dict],
-    *,
-    batch_size: int = 40,
-    use_safe: bool = True,
-) -> Dict[str, Any]:
-    """
-    مزامنة جماعية: إرسال السعر المقترح إلى Make في **دفعات** (مصفوفة لكل طلب)
-    لتقليل الضغط على الحدود (Rate limits) مع بقاء كل طلب = payload واحد {products: [...]}.
-    """
-    if not products:
-        return {
-            "success": False,
-            "message": "❌ لا توجد منتجات للمزامنة",
-            "sent": 0,
-            "failed_batches": 0,
-            "blocked": 0,
-        }
-    if not is_pricing_webhook_configured():
-        return {
-            "success": False,
-            "message": "❌ عرّف WEBHOOK_UPDATE_PRICES في متغيرات البيئة أو `.streamlit/secrets.toml`",
-            "sent": 0,
-            "failed_batches": 0,
-            "blocked": 0,
-        }
-
-    total_sent = 0
-    total_blocked = 0
-    failed_batches = 0
-    details: List[str] = []
-
-    for i in range(0, len(products), max(1, int(batch_size))):
-        batch = products[i : i + batch_size]
-        if use_safe:
-            r = send_price_updates_safe(batch)
-            total_sent += int(r.get("sent", 0) or 0)
-            total_blocked += int(r.get("blocked", 0) or 0)
-            if r.get("sent", 0) == 0 and r.get("blocked", 0) == 0:
-                failed_batches += 1
-            details.append(str(r.get("message", "")))
-        else:
-            r = send_price_updates(batch)
-            if r.get("success"):
-                total_sent += len(
-                    [
-                        p
-                        for p in batch
-                        if str(p.get("name", "")).strip()
-                        and _safe_float(p.get("price", 0)) > 0
-                    ]
-                )
-            else:
-                failed_batches += 1
-            details.append(str(r.get("message", "")))
-        if i + batch_size < len(products):
-            time.sleep(0.5)
-
-    ok = total_sent > 0
-    msg = f"✅ أُرسل {total_sent} تحديثاً"
-    if total_blocked:
-        msg += f" | ⛔ محجوب للمراجعة: {total_blocked}"
-    if failed_batches:
-        msg += f" | ⚠️ دفعات بلا إرسال: {failed_batches}"
-    return {
-        "success": ok,
-        "message": msg,
-        "sent": total_sent,
-        "blocked": total_blocked,
-        "failed_batches": failed_batches,
-        "details": details[:10],
-    }
-
-
 # ══════════════════════════════════════════════════════════════════════
 #  فحص حالة الاتصال بـ Webhooks
 # ══════════════════════════════════════════════════════════════════════════
@@ -795,39 +541,37 @@ def verify_webhook_connection() -> Dict:
         "products": [{
             "product_id": "test-001",
             "name":       "اختبار الاتصال",
-            "price":      1.0,
+            "price":      1,
             "section":    "test",
         }]
     }
-    _wu = get_webhook_update_prices()
-    _wn = get_webhook_new_products()
-    r1 = _post_to_webhook(_wu, test_price_payload)
+    r1 = _post_to_webhook(WEBHOOK_UPDATE_PRICES, test_price_payload)
 
     # فحص Webhook المنتجات الجديدة
     test_new_payload = {
         "data": [{
             "product_id":     "",
             "أسم المنتج":     "اختبار الاتصال",
-            "سعر المنتج":     1.0,
-            "رمز المنتج sku": "",
+            "سعر المنتج":     1,
+            "رمز المنتج sku": "TEST-SKU-001",
             "الوزن":          1,
             "سعر التكلفة":    0,
             "السعر المخفض":   0,
-            "الوصف":          "test",
+            "الوصف":          "اختبار تلقائي من نظام مهووس للتحقق من الاتصال",
         }]
     }
-    r2 = _post_to_webhook(_wn, test_new_payload)
+    r2 = _post_to_webhook(WEBHOOK_NEW_PRODUCTS, test_new_payload)
 
     return {
         "update_prices": {
             "success": r1["success"],
             "message": r1["message"],
-            "url": _wu[:55] + "..." if len(_wu) > 55 else _wu,
+            "url": WEBHOOK_UPDATE_PRICES[:55] + "..." if len(WEBHOOK_UPDATE_PRICES) > 55 else WEBHOOK_UPDATE_PRICES,
         },
         "new_products": {
             "success": r2["success"],
             "message": r2["message"],
-            "url": _wn[:55] + "..." if len(_wn) > 55 else _wn,
+            "url": WEBHOOK_NEW_PRODUCTS[:55] + "..." if len(WEBHOOK_NEW_PRODUCTS) > 55 else WEBHOOK_NEW_PRODUCTS,
         },
         "all_connected": r1["success"] and r2["success"],
     }
