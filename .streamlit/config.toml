@@ -1,13 +1,9 @@
-[server]
-headless = true
-enableCORS = false
-enableXsrfProtection = false
-# ملفات كبيرة (آلاف الصفوف + Excel)
-maxUploadSize = 500
-
 [theme]
-primaryColor = "#6C63FF"
-backgroundColor = "#1a1a2e"
-secondaryBackgroundColor = "#16213e"
-textColor = "#ffffff"
+primaryColor = "#00C853"
+backgroundColor = "#0e1117"
+secondaryBackgroundColor = "#1a1a2e"
+textColor = "#fafafa"
 font = "sans serif"
+
+[server]
+maxUploadSize = 200
