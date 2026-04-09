@@ -1,16 +1,1 @@
-{
-  "running": true,
-  "rows_in_csv": 87,
-  "urls_processed": 9280,
-  "urls_total": 36330,
-  "urls_completed": 18,
-  "urls_failed": 9262,
-  "urls_pending": 27050,
-  "started_at": "2026-03-28T19:20:35.064100+00:00",
-  "finished_at": "2026-03-28T21:13:01.449983+00:00",
-  "last_error": null,
-  "current_sitemap": null,
-  "mode": "continuous",
-  "phase": "process",
-  "last_sync_started_at": "2026-03-28T21:13:01.544506+00:00"
-}
+{"running": false, "health_init": true}
